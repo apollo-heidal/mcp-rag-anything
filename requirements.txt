@@ -1,0 +1,2 @@
+raganything[all]
+python-dotenv
