@@ -1,9 +1,0 @@
-{
-  "name": "mcp-rag-anything",
-  "module": "server.ts",
-  "type": "module",
-  "scripts": { "start": "bun server.ts" },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
-  }
-}

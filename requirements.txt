@@ -1,2 +1,6 @@
 raganything[all]
 python-dotenv
+mcp[cli]
+python-multipart
+aiofiles
+sentence-transformers

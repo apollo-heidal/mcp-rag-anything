@@ -3,12 +3,19 @@ set -euo pipefail
 
 CMD="${1:-help}"
 
+setup() {
+  docker desktop enable model-runner --tcp=12434
+}
+
 pull() {
-  docker model pull ai/qwen3.5:2b-instruct-Q4_K_M
-  docker model pull ai/qwen3-embedding:0.6b-Q4_K_M
+  docker model pull hf.co/unsloth/Qwen3.5-2B-GGUF
+  docker model pull hf.co/unsloth/Qwen3-Embedding-0.6B
 }
 
 case "$CMD" in
+  setup)
+    setup
+    ;;
   pull)
     pull
     ;;
@@ -16,7 +23,7 @@ case "$CMD" in
     docker compose build
     ;;
   start)
-    pull
+    setup
     docker compose up --build
     ;;
   stop)
@@ -27,10 +34,10 @@ case "$CMD" in
     docker model list
     echo ""
     echo "==> Docker Model Runner API:"
-    curl -s http://localhost:12434/engines/llama.cpp/v1/models | python3 -m json.tool
+    curl -s http://localhost:12434/engines/v1/models | python3 -m json.tool
     ;;
   *)
-    echo "Usage: $0 {pull|build|start|stop|verify}"
+    echo "Usage: $0 {setup|pull|build|start|stop|verify}"
     exit 1
     ;;
 esac

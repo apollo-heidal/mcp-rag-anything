@@ -1,16 +1,15 @@
-FROM oven/bun:1 AS base
+FROM python:3.13-slim
 WORKDIR /app
 
-# Copy Bun project
-COPY package.json bun.lock* ./
-RUN bun install --frozen-lockfile
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libreoffice \
+    libgl1 \
+    libglib2.0-0 \
+ && rm -rf /var/lib/apt/lists/*
 
-# Python + venv
-RUN apt-get update && apt-get install -y python3 python3-venv && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt ./
-RUN python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# App source
-COPY server.ts rag_bridge.py ./
+COPY server.py ./
 
-CMD ["bun", "server.ts"]
+CMD ["python", "server.py"]
