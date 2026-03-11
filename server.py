@@ -1,5 +1,5 @@
 """
-MCP RAG-Anything server — single Python process, RAGAnything initialized once.
+RAG-Anywhere server — single Python process, RAGAnything initialized once.
 """
 
 import asyncio
@@ -41,7 +41,7 @@ async def _lifespan(app):
     yield
 
 
-mcp = FastMCP("rag-anything", host="0.0.0.0", lifespan=_lifespan)
+mcp = FastMCP("rag-anywhere", host="0.0.0.0", lifespan=_lifespan)
 
 # ---------------------------------------------------------------------------
 # Singleton RAGAnything instance
@@ -102,8 +102,12 @@ async def _get_rag():
                 lambda: _st_model.encode(texts, show_progress_bar=False)
             )
 
-        embedding_dim = int(_get_env("EMBEDDING_DIM", str(_st_model.get_sentence_embedding_dimension())))
-        embed_func = EmbeddingFunc(embedding_dim=embedding_dim, max_token_size=8192, func=_embed)
+        embedding_dim = int(
+            _get_env("EMBEDDING_DIM", str(_st_model.get_sentence_embedding_dimension()))
+        )
+        embed_func = EmbeddingFunc(
+            embedding_dim=embedding_dim, max_token_size=8192, func=_embed
+        )
 
         _rag = RAGAnything(
             config=config, llm_model_func=llm_func, embedding_func=embed_func
@@ -176,7 +180,9 @@ async def _ingest_background(file_id: str, file_path: Path) -> None:
     await _manifest.update_status(file_id, status="ingesting")
     try:
         rag = await _get_rag()
-        await rag.process_document_complete(file_path=str(file_path), backend=_mineru_backend)
+        await rag.process_document_complete(
+            file_path=str(file_path), backend=_mineru_backend
+        )
         log.info("Ingestion done: %s (%s)", file_path.name, file_id)
         await _manifest.update_status(
             file_id,
@@ -199,7 +205,7 @@ _UI_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RAG-Anything — Document Manager</title>
+<title>RAG-Anywhere — Document Manager</title>
 <style>
   :root {
     --bg: #0f1117;
@@ -256,7 +262,7 @@ _UI_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>RAG-Anything</h1>
+<h1>RAG-Anywhere</h1>
 <p class="subtitle">Upload documents to ingest them into the knowledge graph.</p>
 
 <div class="drop-zone" id="dropZone">
@@ -406,7 +412,9 @@ async def api_file_status(request: Request) -> Response:
     record = await _manifest.get(request.path_params["file_id"])
     if not record:
         return JSONResponse({"error": "not found"}, status_code=404)
-    return JSONResponse({k: record[k] for k in ("id", "status", "error", "ingested_at")})
+    return JSONResponse(
+        {k: record[k] for k in ("id", "status", "error", "ingested_at")}
+    )
 
 
 @mcp.custom_route("/api/files/{file_id}", methods=["DELETE"])
@@ -443,7 +451,9 @@ async def ingest(paths: list[str], recursive: bool = True) -> dict:
                 )
                 added.append(str(path))
             elif path.is_file():
-                await rag.process_document_complete(file_path=str(path), backend=_mineru_backend)
+                await rag.process_document_complete(
+                    file_path=str(path), backend=_mineru_backend
+                )
                 added.append(str(path))
             else:
                 errors.append(f"Path not found: {p}")

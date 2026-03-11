@@ -1,4 +1,4 @@
-# mcp-rag-anything
+# rag-anywhere
 
 An MCP server that gives Claude a persistent RAG knowledge base. Point it at files or folders, then query them with graph-aware retrieval powered by [RAG-Anything](https://github.com/HKUDS/RAG-Anything) / [LightRAG](https://github.com/HKUDS/LightRAG).
 
@@ -17,9 +17,9 @@ That's it. This pulls the models, builds the container, and starts the server.
 ```json
 {
   "mcpServers": {
-    "rag-anything": {
+    "rag-anywhere": {
       "command": "docker",
-      "args": ["compose", "-f", "/absolute/path/to/mcp-rag-anything/docker-compose.yml", "run", "--rm", "mcp-rag"]
+      "args": ["compose", "-f", "/absolute/path/to/mcp-rag-anywhere/docker-compose.yml", "run", "--rm", "mcp-rag"]
     }
   }
 }
