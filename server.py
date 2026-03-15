@@ -4,16 +4,21 @@ RAG-Anywhere server with modality-aware routing and federated query support.
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
+import shlex
 import shutil
 import subprocess
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 from uuid import uuid4
 
 import nest_asyncio
@@ -111,6 +116,10 @@ def _path_to_str(path: Path | None) -> str | None:
     return str(path) if path else None
 
 
+def _base_url() -> str:
+    return _get_env("APP_BASE_URL", "http://localhost:8000").rstrip("/")
+
+
 def _media_tool_status() -> dict:
     return {
         "ffmpeg": shutil.which("ffmpeg"),
@@ -120,6 +129,46 @@ def _media_tool_status() -> dict:
 
 def _vision_required() -> bool:
     return _get_env("VISION_REQUIRED", "true").lower() == "true"
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _grant_secret() -> bytes:
+    return _get_env("RAG_SESSION_SECRET", "change-me-for-production").encode("utf-8")
+
+
+def _sign_grant_payload(payload: str) -> str:
+    digest = hmac.new(_grant_secret(), payload.encode("utf-8"), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+
+
+def _mint_grant_token(grant_id: str, grant_type: str, expires_at: str) -> str:
+    payload = json.dumps(
+        {"id": grant_id, "type": grant_type, "exp": expires_at},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    encoded_payload = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("utf-8").rstrip("=")
+    signature = _sign_grant_payload(encoded_payload)
+    return f"{encoded_payload}.{signature}"
+
+
+def _parse_grant_token(token: str) -> tuple[str, str, str]:
+    try:
+        encoded_payload, signature = token.split(".", 1)
+    except ValueError as exc:
+        raise ValueError("Invalid grant token") from exc
+    expected = _sign_grant_payload(encoded_payload)
+    if not hmac.compare_digest(signature, expected):
+        raise ValueError("Grant signature mismatch")
+    try:
+        padded = encoded_payload + "=" * (-len(encoded_payload) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        return payload["id"], payload["type"], payload["exp"]
+    except Exception as exc:
+        raise ValueError("Invalid grant token") from exc
 
 
 def _infer_image_mime(image_bytes: bytes) -> str:
@@ -726,6 +775,138 @@ class FileManifest:
 _manifest = FileManifest(_working_dir)
 
 
+class GrantStore:
+    def __init__(self, working_dir: str):
+        self._path = Path(working_dir) / "grants.json"
+        self._lock = asyncio.Lock()
+
+    async def _load(self) -> dict[str, dict]:
+        if not self._path.exists():
+            return {}
+        async with aiofiles.open(self._path) as f:
+            return json.loads(await f.read())
+
+    async def _save(self, grants: dict[str, dict]) -> None:
+        async with aiofiles.open(self._path, "w") as f:
+            await f.write(json.dumps(grants, indent=2))
+
+    async def issue(
+        self,
+        *,
+        grant_type: str,
+        subject: str,
+        ttl_seconds: int,
+        metadata: dict | None = None,
+        max_uses: int | None = None,
+    ) -> dict:
+        async with self._lock:
+            grants = await self._load()
+            grant_id = secrets.token_urlsafe(12)
+            expires_at = (_now_utc()).timestamp() + ttl_seconds
+            grant = {
+                "id": grant_id,
+                "type": grant_type,
+                "subject": subject,
+                "issued_at": _iso_now(),
+                "expires_at": datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
+                "metadata": metadata or {},
+                "max_uses": max_uses,
+                "uses": 0,
+                "used_at": None,
+                "revoked": False,
+            }
+            grants[grant_id] = grant
+            await self._save(grants)
+            grant["token"] = _mint_grant_token(grant_id, grant_type, grant["expires_at"])
+            return grant
+
+    async def get_valid(self, token: str, expected_type: str) -> dict:
+        grant_id, grant_type, expires_at = _parse_grant_token(token)
+        if grant_type != expected_type:
+            raise ValueError("Grant type mismatch")
+        if datetime.fromisoformat(expires_at) <= _now_utc():
+            raise ValueError("Grant expired")
+        async with self._lock:
+            grants = await self._load()
+            grant = grants.get(grant_id)
+            if not grant or grant.get("revoked"):
+                raise ValueError("Grant not found")
+            if grant.get("type") != expected_type:
+                raise ValueError("Grant type mismatch")
+            if grant.get("expires_at") != expires_at:
+                raise ValueError("Grant expiration mismatch")
+            if datetime.fromisoformat(grant["expires_at"]) <= _now_utc():
+                raise ValueError("Grant expired")
+            max_uses = grant.get("max_uses")
+            if max_uses is not None and grant.get("uses", 0) >= max_uses:
+                raise ValueError("Grant already used")
+            return grant
+
+    async def mark_used(self, grant_id: str) -> None:
+        async with self._lock:
+            grants = await self._load()
+            grant = grants.get(grant_id)
+            if not grant:
+                return
+            grant["uses"] = int(grant.get("uses", 0)) + 1
+            grant["used_at"] = _iso_now()
+            grants[grant_id] = grant
+            await self._save(grants)
+
+
+_grants = GrantStore(_working_dir)
+
+
+def _request_grant_token(request: Request) -> str | None:
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header.split(" ", 1)[1].strip()
+    return request.query_params.get("grant")
+
+
+async def _require_grant(request: Request, expected_type: str) -> tuple[dict | None, Response | None]:
+    token = _request_grant_token(request)
+    if not token:
+        return None, JSONResponse({"error": f"missing {expected_type} grant"}, status_code=401)
+    try:
+        grant = await _grants.get_valid(token, expected_type)
+    except Exception as exc:
+        return None, JSONResponse({"error": str(exc)}, status_code=401)
+    return grant, None
+
+
+async def _issue_ui_session(subject: str, ttl_seconds: int | None = None) -> dict:
+    ttl = ttl_seconds or int(_get_env("UI_SESSION_TTL_SECONDS", "900"))
+    grant = await _grants.issue(
+        grant_type="ui_session",
+        subject=subject,
+        ttl_seconds=ttl,
+        metadata={"surface": "ui"},
+        max_uses=None,
+    )
+    grant["url"] = f"{_base_url()}/ui?grant={quote(grant['token'])}"
+    return grant
+
+
+async def _issue_upload_link(
+    subject: str,
+    *,
+    collection_id: str | None = None,
+    filename: str | None = None,
+    ttl_seconds: int | None = None,
+) -> dict:
+    ttl = ttl_seconds or int(_get_env("UPLOAD_LINK_TTL_SECONDS", "900"))
+    grant = await _grants.issue(
+        grant_type="upload",
+        subject=subject,
+        ttl_seconds=ttl,
+        metadata={"collection_id": collection_id or _default_collection_id, "filename": filename},
+        max_uses=1,
+    )
+    grant["upload_url"] = f"{_base_url()}/api/upload/{quote(grant['token'])}"
+    return grant
+
+
 @dataclass
 class QueryEnvelope:
     answer: str
@@ -1140,7 +1321,7 @@ _UI_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <h1>RAG-Anywhere</h1>
-<p class="subtitle">Uploads are routed by modality: documents go to RAGAnything, audio is transcribed into the document graph, and video is indexed by the in-process VideoEngineAdapter.</p>
+<p class="subtitle">Uploads are routed by modality: documents go to RAGAnything, audio is transcribed into the document graph, and video is indexed by the in-process VideoEngineAdapter. Access to this library is granted by a signed session link.</p>
 
 <div class="drop-zone" id="dropZone">
   <div>&#128249; Drop files here</div>
@@ -1162,6 +1343,13 @@ const tbody = document.getElementById('tbody');
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
 const polls = {};
+const grant = new URLSearchParams(window.location.search).get('grant');
+
+function withGrant(url) {
+  const target = new URL(url, window.location.origin);
+  if (grant) target.searchParams.set('grant', grant);
+  return `${target.pathname}${target.search}`;
+}
 
 function fmtDate(iso) {
   if (!iso) return '—';
@@ -1193,13 +1381,13 @@ function render(files) {
   });
 }
 async function load() {
-  const res = await fetch('/api/files');
+  const res = await fetch(withGrant('/api/files'));
   render(await res.json());
 }
 function startPoll(id) {
   if (polls[id]) return;
   polls[id] = setInterval(async () => {
-    const res = await fetch(`/api/files/${id}/status`);
+    const res = await fetch(withGrant(`/api/files/${id}/status`));
     if (!res.ok) { clearInterval(polls[id]); delete polls[id]; return; }
     const data = await res.json();
     const row = document.getElementById(`status-${id}`);
@@ -1214,13 +1402,13 @@ function startPoll(id) {
 async function upload(file) {
   const fd = new FormData();
   fd.append('file', file);
-  const res = await fetch('/api/upload', { method: 'POST', body: fd });
+  const res = await fetch(withGrant('/api/upload'), { method: 'POST', body: fd });
   const data = await res.json();
   await load();
   startPoll(data.id);
 }
 async function delFile(id) {
-  await fetch(`/api/files/${id}`, { method: 'DELETE' });
+  await fetch(withGrant(`/api/files/${id}`), { method: 'DELETE' });
   clearInterval(polls[id]);
   delete polls[id];
   await load();
@@ -1233,7 +1421,13 @@ dropZone.addEventListener('drop', e => {
   dropZone.classList.remove('drag-over');
   [...e.dataTransfer.files].forEach(upload);
 });
-load();
+if (!grant) {
+  tbody.innerHTML = '<tr><td colspan="7" class="empty">Missing session grant. Request a new UI link from MCP.</td></tr>';
+  dropZone.style.pointerEvents = 'none';
+  dropZone.style.opacity = '0.6';
+} else {
+  load();
+}
 </script>
 </body>
 </html>"""
@@ -1253,40 +1447,26 @@ async def _lifespan(app):
 mcp = FastMCP("rag-anywhere", host="0.0.0.0", lifespan=_lifespan)
 
 
-@mcp.custom_route("/ui", methods=["GET"])
-async def ui_index(request: Request) -> Response:
-    return HTMLResponse(_UI_HTML)
-
-
-@mcp.custom_route("/api/files", methods=["GET"])
-async def api_list_files(request: Request) -> Response:
-    return JSONResponse(await _manifest.load())
-
-
-@mcp.custom_route("/api/upload", methods=["POST"])
-async def api_upload(request: Request) -> Response:
-    form = await request.form()
-    upload = form["file"]
-    collection_id = form.get("collection_id", _default_collection_id)
-    file_id = uuid4().hex[:8]
-    safe_name = f"{file_id}_{re.sub(r'[^a-zA-Z0-9._-]', '_', upload.filename)}"
-    dest = _uploads_dir / safe_name
-    async with aiofiles.open(dest, "wb") as f:
-        await f.write(await upload.read())
-
-    modality = _classify_file(dest)
-    record = {
+def _build_file_record(
+    *,
+    file_id: str,
+    safe_name: str,
+    original_name: str,
+    path: Path,
+    collection_id: str,
+) -> dict:
+    return {
         "id": file_id,
         "name": safe_name,
-        "original_name": upload.filename,
-        "path": str(dest),
-        "size_bytes": dest.stat().st_size,
+        "original_name": original_name,
+        "path": str(path),
+        "size_bytes": path.stat().st_size,
         "uploaded_at": _iso_now(),
         "status": "uploading",
         "ingested_at": None,
         "error": None,
         "collection_id": collection_id,
-        "modality": modality,
+        "modality": _classify_file(path),
         "ingest_path": "pending",
         "engine": None,
         "engine_doc_id": None,
@@ -1296,15 +1476,79 @@ async def api_upload(request: Request) -> Response:
         "fallback_reason": None,
         "image_processing": None,
     }
+
+
+async def _store_upload_file(upload, collection_id: str) -> dict:
+    file_id = uuid4().hex[:8]
+    safe_name = f"{file_id}_{re.sub(r'[^a-zA-Z0-9._-]', '_', upload.filename)}"
+    dest = _uploads_dir / safe_name
+    async with aiofiles.open(dest, "wb") as f:
+        await f.write(await upload.read())
+
+    record = _build_file_record(
+        file_id=file_id,
+        safe_name=safe_name,
+        original_name=upload.filename,
+        path=dest,
+        collection_id=collection_id,
+    )
     await _manifest.add(record)
     _ingest_tasks[file_id] = asyncio.create_task(_ingest_background(file_id, dest))
-    return JSONResponse(
-        {"id": file_id, "status": "uploading", "modality": modality}, status_code=202
+    return {"id": file_id, "status": "uploading", "modality": record["modality"]}
+
+
+@mcp.custom_route("/ui", methods=["GET"])
+async def ui_index(request: Request) -> Response:
+    _, error = await _require_grant(request, "ui_session")
+    if error:
+        return error
+    return HTMLResponse(_UI_HTML)
+
+
+@mcp.custom_route("/api/files", methods=["GET"])
+async def api_list_files(request: Request) -> Response:
+    _, error = await _require_grant(request, "ui_session")
+    if error:
+        return error
+    return JSONResponse(await _manifest.load())
+
+
+@mcp.custom_route("/api/upload", methods=["POST"])
+async def api_upload(request: Request) -> Response:
+    grant, error = await _require_grant(request, "ui_session")
+    if error:
+        return error
+    form = await request.form()
+    upload = form["file"]
+    collection_id = form.get(
+        "collection_id",
+        grant.get("metadata", {}).get("collection_id") or _default_collection_id,
     )
+    result = await _store_upload_file(upload, collection_id)
+    return JSONResponse(result, status_code=202)
+
+
+@mcp.custom_route("/api/upload/{grant_token}", methods=["POST"])
+async def api_upload_with_grant(request: Request) -> Response:
+    token = request.path_params["grant_token"]
+    try:
+        grant = await _grants.get_valid(token, "upload")
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=401)
+
+    form = await request.form()
+    upload = form["file"]
+    collection_id = grant.get("metadata", {}).get("collection_id") or _default_collection_id
+    result = await _store_upload_file(upload, collection_id)
+    await _grants.mark_used(grant["id"])
+    return JSONResponse(result, status_code=202)
 
 
 @mcp.custom_route("/api/files/{file_id}/status", methods=["GET"])
 async def api_file_status(request: Request) -> Response:
+    _, error = await _require_grant(request, "ui_session")
+    if error:
+        return error
     record = await _manifest.get(request.path_params["file_id"])
     if not record:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -1327,6 +1571,9 @@ async def api_file_status(request: Request) -> Response:
 
 @mcp.custom_route("/api/files/{file_id}", methods=["DELETE"])
 async def api_delete_file(request: Request) -> Response:
+    _, error = await _require_grant(request, "ui_session")
+    if error:
+        return error
     file_id = request.path_params["file_id"]
     record = await _manifest.get(file_id)
     if not record:
@@ -1366,6 +1613,11 @@ async def api_health(request: Request) -> Response:
         {
             "ok": True,
             "video_engine_enabled": _video_engine_enabled,
+            "control_plane": {
+                "base_url": _base_url(),
+                "ui_session_ttl_seconds": int(_get_env("UI_SESSION_TTL_SECONDS", "900")),
+                "upload_link_ttl_seconds": int(_get_env("UPLOAD_LINK_TTL_SECONDS", "900")),
+            },
             "video_engine": video_health,
             "vision_model": _get_env("VISION_MODEL", "docker.io/local/qwen3.5-2b-vlm:latest"),
             "vision_api_base": _get_env(
@@ -1535,9 +1787,44 @@ async def query(
 
 
 @mcp.tool()
-async def ingest(paths: list[str], recursive: bool = True) -> dict:
-    """Ingest documents, audio, or video files into the routed RAG system."""
-    return await _ingest_paths(paths=paths, recursive=recursive)
+async def create_ui_session_link(
+    requested_for: str = "local-user",
+    ttl_seconds: int = 900,
+) -> dict:
+    """Create a short-lived signed link for the browser UI."""
+    grant = await _issue_ui_session(requested_for, ttl_seconds=ttl_seconds)
+    return {
+        "url": grant["url"],
+        "expires_at": grant["expires_at"],
+        "subject": grant["subject"],
+        "grant_type": grant["type"],
+    }
+
+
+@mcp.tool()
+async def create_upload_link(
+    requested_for: str = "local-user",
+    filename: str = "/absolute/path/to/file",
+    collection_id: str | None = None,
+    ttl_seconds: int = 900,
+) -> dict:
+    """Create a one-time upload URL for agents to push files over HTTP."""
+    grant = await _issue_upload_link(
+        requested_for,
+        collection_id=collection_id,
+        filename=filename,
+        ttl_seconds=ttl_seconds,
+    )
+    curl_example = f"curl -f -X POST -F file=@{shlex.quote(filename)} {shlex.quote(grant['upload_url'])}"
+    return {
+        "upload_url": grant["upload_url"],
+        "expires_at": grant["expires_at"],
+        "subject": grant["subject"],
+        "grant_type": grant["type"],
+        "collection_id": grant["metadata"].get("collection_id"),
+        "filename_hint": grant["metadata"].get("filename"),
+        "curl_example": curl_example,
+    }
 
 
 if __name__ == "__main__":

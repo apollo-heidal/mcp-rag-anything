@@ -1,5 +1,5 @@
 services:
-    mcp-anywhere:
+    rag-anywhere:
         build: .
         ports:
             - "8000:8000"
@@ -9,6 +9,10 @@ services:
         environment:
             - OPENAI_API_KEY=docker-model-runner
             - RAG_WORKING_DIR=/root/.rag_storage
+            - APP_BASE_URL=${APP_BASE_URL:-http://localhost:8000}
+            - RAG_SESSION_SECRET=${RAG_SESSION_SECRET:-change-me-for-production}
+            - UI_SESSION_TTL_SECONDS=${UI_SESSION_TTL_SECONDS:-900}
+            - UPLOAD_LINK_TTL_SECONDS=${UPLOAD_LINK_TTL_SECONDS:-900}
             - FASTMCP_HOST=0.0.0.0
             - DEFAULT_COLLECTION_ID=default
             - VISION_REQUIRED=${VISION_REQUIRED:-true}

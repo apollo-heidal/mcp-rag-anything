@@ -1,6 +1,6 @@
 # rag-anywhere
 
-An MCP server that gives agents a persistent RAG knowledge base. Point it at files or folders, then query them through a unified interface that routes documents to [RAG-Anything](https://github.com/HKUDS/RAG-Anything) / [LightRAG](https://github.com/HKUDS/LightRAG), routes audio through local transcription into the document graph, and routes video through an in-process `VideoEngineAdapter` backed by vendored VideoRAG code.
+An MCP-first runtime that gives agents a persistent RAG knowledge base. Upload files through signed browser or upload links, then query them through a unified interface that routes documents to [RAG-Anything](https://github.com/HKUDS/RAG-Anything) / [LightRAG](https://github.com/HKUDS/LightRAG), routes audio through local transcription into the document graph, and routes video through an in-process `VideoEngineAdapter` backed by vendored VideoRAG code.
 
 ## Prerequisites
 
@@ -48,13 +48,9 @@ Start the server first with `docker compose up --build`.
 
 | Tool | Description |
 |------|-------------|
-| `ingest` | Add documents, audio, video, files or folders to the knowledge base |
 | `query` | Retrieve context using routed / federated RAG |
-
-### `ingest`
-```json
-{ "paths": ["/absolute/path/to/file-or-folder"], "recursive": true }
-```
+| `create_ui_session_link` | Create a short-lived signed browser link to the library UI |
+| `create_upload_link` | Create a one-time upload URL for agent-driven file upload over HTTP |
 
 ### `query`
 ```json
@@ -64,6 +60,21 @@ Start the server first with `docker compose up --build`.
   "target": "auto",
   "collection_ids": ["default"],
   "top_k": 8
+}
+```
+
+### `create_ui_session_link`
+```json
+{ "requested_for": "alice", "ttl_seconds": 900 }
+```
+
+### `create_upload_link`
+```json
+{
+  "requested_for": "alice",
+  "filename": "/absolute/path/to/file.pdf",
+  "collection_id": "default",
+  "ttl_seconds": 900
 }
 ```
 
@@ -87,7 +98,7 @@ Claude / MCP Client
                     vendored VideoRAG + local vision / ASR models
 ```
 
-`server.py` is a single Python process that serves as both the MCP server and a web UI for uploading files. It classifies uploads into document, audio, or video, records routing metadata in the manifest, and federates a single query across the document and video engines. The `VideoEngineAdapter` runs in the same process as the rest of the app, with per-video workspaces under `RAG_WORKING_DIR`. Embeddings are computed locally via SentenceTransformers. Config is loaded from environment variables, with `.env` as a fallback for local (non-Docker) runs.
+`server.py` is a single Python process that serves as the MCP surface, the browser UI surface, and the local runtime. MCP is the only RAG interface for agents. HTTP is kept for signed UI sessions, uploads, and health/admin endpoints. The server classifies uploads into document, audio, or video, records routing metadata in the manifest, and federates a single query across the document and video engines. The `VideoEngineAdapter` runs in the same process as the rest of the app, with per-video workspaces under `RAG_WORKING_DIR`. Embeddings are computed locally via SentenceTransformers. Config is loaded from environment variables, with `.env` as a fallback for local (non-Docker) runs.
 
 ## Media routing
 
@@ -98,7 +109,14 @@ Claude / MCP Client
 - Native video ingest probes source audio with `ffprobe` and extracts segment audio with `ffmpeg` before ASR. If a lecture-style video has an audio stream but segment extraction or transcription still fails, ingest ends as `error` instead of degrading silently.
 - Video ingest fails closed if native video indexing cannot complete. There is no transcript-only success path for video files.
 
-The web UI at `/ui` shows the detected modality, the selected ingest path, and the engine used for each file.
+The web UI at `/ui` is accessed through a signed session link and shows the detected modality, the selected ingest path, and the engine used for each file.
+
+## Agent upload flow
+
+- Agents should not call an ingest tool with local filesystem paths. The MCP server cannot assume access to the agent host filesystem.
+- For browser-based interaction, call `create_ui_session_link` and open the returned URL.
+- For direct file transfer, call `create_upload_link` and `POST` the file to the returned one-time URL.
+- `create_upload_link` returns a generic `curl` example so shell-capable agents can upload files on macOS, Linux, or Windows environments that provide `curl`.
 
 Useful runtime commands:
 
@@ -153,6 +171,10 @@ Copy `.env.example` to `.env` and edit for local (non-Docker) runs. Docker Compo
 | `ST_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Local SentenceTransformers embedding model |
 | `EMBEDDING_DIM` | unset | Embedding dimension override; when unset, `server.py` auto-detects it from `ST_MODEL` |
 | `OPENAI_API_KEY` | `docker-model-runner` | Required by client lib; value ignored by Model Runner |
+| `APP_BASE_URL` | `http://localhost:8000` | External base URL used when generating signed UI and upload links |
+| `RAG_SESSION_SECRET` | `change-me-for-production` | HMAC secret used to sign short-lived UI and upload grants |
+| `UI_SESSION_TTL_SECONDS` | `900` | Default TTL for signed browser UI session links |
+| `UPLOAD_LINK_TTL_SECONDS` | `900` | Default TTL for one-time upload links |
 | `RAG_WORKING_DIR` | `~/.rag_storage` | Where LightRAG stores its graph and vectors |
 | `DEFAULT_COLLECTION_ID` | `default` | Collection assigned to uploads when none is provided |
 | `VIDEO_ENGINE_ENABLED` | `true` | Enables the in-process `VideoEngineAdapter` |
