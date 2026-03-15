@@ -72,10 +72,12 @@ async def _get_rag():
 
         working_dir = _get_env("RAG_WORKING_DIR", str(Path.home() / ".rag_storage"))
         output_dir = _get_env("RAG_OUTPUT_DIR", str(Path(working_dir) / "output"))
-        api_base = _get_env("LLM_API_BASE", "https://api.openai.com/v1")
-        llm_model = _get_env("LLM_MODEL", "gpt-4o-mini")
-        embedding_model = _get_env("EMBEDDING_MODEL", "text-embedding-3-small")
-        api_key = _get_env("OPENAI_API_KEY", "")
+        api_base = _get_env("LLM_API_BASE", "http://localhost:12434/engines/v1")
+        llm_model = _get_env("LLM_MODEL", "hf.co/unsloth/Qwen3.5-2B-GGUF")
+        embedding_model = _get_env(
+            "EMBEDDING_MODEL", "hf.co/unsloth/Qwen3-Embedding-0.6B"
+        )
+        api_key = _get_env("OPENAI_API_KEY", "docker-model-runner")
 
         os.makedirs(working_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
