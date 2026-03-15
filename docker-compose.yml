@@ -10,6 +10,11 @@ services:
             - OPENAI_API_KEY=docker-model-runner
             - RAG_WORKING_DIR=/root/.rag_storage
             - FASTMCP_HOST=0.0.0.0
+            - DEFAULT_COLLECTION_ID=default
+            - VISION_REQUIRED=${VISION_REQUIRED:-true}
+            - VIDEO_ENGINE_ENABLED=${VIDEO_ENGINE_ENABLED:-true}
+            - VIDEO_SEGMENT_LENGTH=${VIDEO_SEGMENT_LENGTH:-30}
+            - AUDIO_TRANSCRIBE_MODEL=${AUDIO_TRANSCRIBE_MODEL:-openai/whisper-small}
             # MinerU: offload VLM inference to Docker Model Runner (uses Metal on host)
             # If MinerU needs a separate VLM model, provision it through the local Docker Model Runner workflow.
             - MINERU_BACKEND=pipeline
@@ -17,6 +22,9 @@ services:
             llm:
                 endpoint_var: LLM_API_BASE
                 model_var: LLM_MODEL
+            vision:
+                endpoint_var: VISION_API_BASE
+                model_var: VISION_MODEL
             embedding:
                 endpoint_var: EMBEDDING_API_BASE
                 model_var: EMBEDDING_MODEL
@@ -24,5 +32,7 @@ services:
 models:
     llm:
         model: ${LLM_MODEL:-hf.co/unsloth/Qwen3.5-2B-GGUF}
+    vision:
+        model: ${VISION_MODEL:-docker.io/local/qwen3.5-2b-vlm:latest}
     embedding:
         model: ${EMBEDDING_MODEL:-hf.co/unsloth/Qwen3-Embedding-0.6B}

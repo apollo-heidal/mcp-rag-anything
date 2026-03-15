@@ -5,3 +5,4 @@ hf_cache/
 node_modules/
 .claude/
 data
+model_assets

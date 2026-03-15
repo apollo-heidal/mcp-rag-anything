@@ -78,6 +78,7 @@ mdurl==0.1.2
 mineru==2.7.6
 mineru-vl-utils==0.1.22
 modelscope==1.34.0
+moviepy==2.2.1
 mpmath==1.3.0
 multidict==6.7.1
 nano-vectordb==0.0.4.3
