@@ -1,4 +1,7 @@
 .env
 .venv/
+rag_storage/
+hf_cache/
 node_modules/
 .claude/
+data

@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+import nest_asyncio
+nest_asyncio.apply()
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 import aiofiles
@@ -467,7 +470,8 @@ async def ingest(paths: list[str], recursive: bool = True) -> dict:
 async def query(query: str, mode: str = "mix") -> dict:
     """Query the RAG knowledge graph."""
     rag = await _get_rag()
-    result = await rag.query(query, mode=mode)
+    await rag._ensure_lightrag_initialized()
+    result = await rag.aquery(query, mode=mode)
     return {"result": result}
 
 

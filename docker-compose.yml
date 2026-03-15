@@ -4,8 +4,8 @@ services:
         ports:
             - "8000:8000"
         volumes:
-            - rag_storage:/root/.rag_storage
-            - hf_cache:/root/.cache/huggingface
+            - ./rag_storage:/root/.rag_storage
+            - ./hf_cache:/root/.cache/huggingface
         environment:
             - LLM_API_BASE=http://model-runner.docker.internal/engines/v1
             - LLM_MODEL=${LLM_MODEL:-hf.co/unsloth/Qwen3.5-2B-GGUF}
@@ -16,7 +16,3 @@ services:
             # MinerU: offload VLM inference to Docker Model Runner (uses Metal on host)
             # Prerequisite: docker model pull hf.co/mlx-community/Qwen2.5-VL-7B-Instruct-4bit
             - MINERU_BACKEND=pipeline
-
-volumes:
-    rag_storage:
-    hf_cache:
