@@ -58,6 +58,7 @@ _DOCUMENT_EXTENSIONS = {
 }
 _AUDIO_EXTENSIONS = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".wav"}
 _VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
+_ARCHIVE_EXTENSIONS = {".zip"}
 
 _working_dir = os.environ.get("RAG_WORKING_DIR", str(Path.home() / ".rag_storage"))
 _uploads_dir = Path(_working_dir) / "uploads"
@@ -96,6 +97,8 @@ def _get_env(key: str, default: str) -> str:
 
 def _classify_file(path: Path) -> str:
     suffix = path.suffix.lower()
+    if suffix in _ARCHIVE_EXTENSIONS:
+        return "archive"
     if suffix in _AUDIO_EXTENSIONS:
         return "audio"
     if suffix in _VIDEO_EXTENSIONS:
@@ -783,6 +786,26 @@ class FileManifest:
             result.append(record)
         return result
 
+    async def remove_by_parent(self, parent_archive_id: str) -> list[dict]:
+        async with self._lock:
+            records = json.loads(self._path.read_text()) if self._path.exists() else []
+            removed = []
+            kept = []
+            for record in records:
+                if record.get("parent_archive_id") == parent_archive_id:
+                    removed.append(record)
+                else:
+                    kept.append(record)
+            if removed:
+                await self._save(kept)
+            return removed
+
+    async def find_by_hash(self, content_hash: str) -> dict | None:
+        for record in await self.load():
+            if record.get("content_hash") == content_hash:
+                return record
+        return None
+
     async def remove(self, file_id: str) -> dict | None:
         async with self._lock:
             records = json.loads(self._path.read_text()) if self._path.exists() else []
@@ -1213,6 +1236,7 @@ _video_engine = VideoEngineAdapter()
 
 
 async def _ingest_document(file_id: str, file_path: Path) -> dict:
+    await _manifest.update(file_id, status="ingesting")
     result = await _document_engine.ingest_file(file_path, doc_id=file_id)
     return {
         "status": "done",
@@ -1275,6 +1299,67 @@ async def _ingest_video(file_id: str, file_path: Path, record: dict) -> dict:
     }
 
 
+async def _ingest_archive(file_id: str, file_path: Path, record: dict) -> dict:
+    from dedup import compute_file_hash
+    from zip_handler import extract_recursive
+
+    await _manifest.update(file_id, status="extracting")
+    extract_dir = _uploads_dir / f"{file_id}_extracted"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    extracted_files = await extract_recursive(file_path, extract_dir)
+    total = len(extracted_files)
+
+    child_ids = []
+    skipped = []
+    errors = []
+    for idx, child_path in enumerate(extracted_files, 1):
+        await _manifest.update(file_id, status=f"processing {idx}/{total}")
+        try:
+            content_hash = await compute_file_hash(child_path)
+            existing = await _manifest.find_by_hash(content_hash)
+            if existing:
+                skipped.append({
+                    "name": child_path.name,
+                    "duplicate_of": existing["id"],
+                    "original_name": existing["original_name"],
+                })
+                continue
+
+            child_id = uuid4().hex[:8]
+            safe_name = _safe_filename(child_id, child_path.name)
+            child_dest = _uploads_dir / safe_name
+            shutil.copy2(str(child_path), str(child_dest))
+
+            child_record = _build_file_record(
+                file_id=child_id,
+                safe_name=safe_name,
+                original_name=child_path.name,
+                path=child_dest,
+                collection_id=record["collection_id"],
+                content_hash=content_hash,
+                parent_archive_id=file_id,
+            )
+            child_record["status"] = "queued"
+            await _manifest.add(child_record)
+            await _ingest_background(child_id, child_dest)
+            child_ids.append(child_id)
+        except Exception as exc:
+            errors.append({"name": child_path.name, "error": str(exc)})
+
+    shutil.rmtree(str(extract_dir), ignore_errors=True)
+    summary = f"done ({len(child_ids)} ingested, {len(skipped)} skipped, {len(errors)} errors)"
+    return {
+        "status": "done",
+        "archive_progress": summary,
+        "files_extracted": total,
+        "files_ingested": len(child_ids),
+        "files_skipped": len(skipped),
+        "skipped_details": skipped,
+        "child_ids": child_ids,
+        "ingested_at": _iso_now(),
+    }
+
+
 async def _ingest_background(file_id: str, file_path: Path) -> None:
     log = logging.getLogger("ingest")
     record = await _manifest.get(file_id)
@@ -1286,7 +1371,9 @@ async def _ingest_background(file_id: str, file_path: Path) -> None:
     await _manifest.update(file_id, status="routing")
     try:
         modality = record["modality"]
-        if modality == "audio":
+        if modality == "archive":
+            updates = await _ingest_archive(file_id, file_path, record)
+        elif modality == "audio":
             updates = await _ingest_audio(file_id, file_path, record)
         elif modality == "video":
             updates = await _ingest_video(file_id, file_path, record)
@@ -1373,6 +1460,15 @@ _UI_HTML = """<!DOCTYPE html>
   .empty { text-align: center; color: var(--muted); padding: 3rem; font-size: 0.875rem; }
   .table-wrap { background: var(--surface); border-radius: var(--radius); border: 1px solid var(--border); overflow: hidden; }
   .mono { font-family: ui-monospace, SFMono-Regular, monospace; color: var(--muted); }
+  .badge-error-wrap { position: relative; display: inline-block; }
+  .badge-error-wrap:hover .error-tooltip { display: block; }
+  .error-tooltip {
+    display: none; position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
+    margin-bottom: 6px; padding: 0.5rem 0.75rem; max-width: 300px; width: max-content;
+    background: #1e1e2e; color: var(--error); border: 1px solid var(--error); border-radius: 6px;
+    font-size: 0.75rem; line-height: 1.4; white-space: pre-wrap; word-break: break-word; z-index: 10;
+  }
+  .status-detail { display: block; font-size: 0.65rem; color: var(--muted); margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -1381,7 +1477,7 @@ _UI_HTML = """<!DOCTYPE html>
 
 <div class="drop-zone" id="dropZone">
   <div>&#128249; Drop files here</div>
-  <p>Documents, audio, or video. Video ingest requires native video indexing and returns timestamped segments.</p>
+  <p>Documents, audio, video, or ZIP archives. Video ingest requires native video indexing and returns timestamped segments.</p>
   <label class="drop-btn">Browse files<input type="file" id="fileInput" multiple hidden></label>
 </div>
 
@@ -1411,11 +1507,33 @@ function fmtDate(iso) {
   if (!iso) return '—';
   return new Date(iso).toLocaleString();
 }
-function badge(status) {
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function badge(status, data) {
+  data = data || {};
   const spin = `<div class="spinner"></div>`;
   if (status === 'done') return `<span class="badge badge-done">&#10003; Done</span>`;
-  if (status === 'error') return `<span class="badge badge-error">&#10007; Error</span>`;
-  return `<span class="badge badge-pending">${spin} ${status}</span>`;
+  if (status === 'duplicate') return `<span class="badge badge-pending">&#9888; Duplicate</span>`;
+  if (status === 'error') {
+    const tip = data.error ? `<span class="error-tooltip">${esc(data.error)}</span>` : '';
+    return `<span class="badge-error-wrap"><span class="badge badge-error">&#10007; Error</span>${tip}</span>`;
+  }
+  let label = status;
+  let detail = '';
+  if (status === 'routing') { label = 'Classifying\u2026'; }
+  else if (status === 'transcribing') { label = 'Transcribing audio\u2026'; }
+  else if (status === 'extracting') { label = 'Extracting archive\u2026'; }
+  else if (status && status.startsWith('processing')) {
+    label = 'Processing archive\u2026';
+    const m = status.match(/processing\\s+(\\d+\\/\\d+)/);
+    if (m) detail = m[1];
+  }
+  else if (status === 'indexing-video') {
+    label = 'Indexing video\u2026';
+    if (data.video_stage) detail = data.video_stage;
+  }
+  else if (status === 'ingesting') { label = 'Ingesting document\u2026'; }
+  const detailHtml = detail ? `<span class="status-detail">${esc(detail)}</span>` : '';
+  return `<span class="badge badge-pending">${spin} ${esc(label)}</span>${detailHtml}`;
 }
 function render(files) {
   if (!files.length) {
@@ -1424,16 +1542,16 @@ function render(files) {
   }
   tbody.innerHTML = files.map(f => `
     <tr id="row-${f.id}">
-      <td title="${f.original_name}">${f.original_name}</td>
+      <td title="${f.original_name}">${f.parent_archive_id ? '&nbsp;&nbsp;&#8627; ' : ''}${f.original_name}</td>
       <td>${f.modality || 'document'}</td>
       <td class="mono">${f.ingest_path || 'pending'}</td>
       <td>${f.engine || 'pending'}</td>
-      <td id="status-${f.id}">${badge(f.status)}</td>
+      <td id="status-${f.id}">${badge(f.status, f)}</td>
       <td>${fmtDate(f.uploaded_at)}</td>
       <td><button class="del-btn" onclick="delFile('${f.id}')" title="Remove">&#128465;</button></td>
     </tr>`).join('');
   files.forEach(f => {
-    if (!['done', 'error'].includes(f.status)) startPoll(f.id);
+    if (!['done', 'error', 'duplicate'].includes(f.status)) startPoll(f.id);
   });
 }
 async function load() {
@@ -1447,8 +1565,8 @@ function startPoll(id) {
     if (!res.ok) { clearInterval(polls[id]); delete polls[id]; return; }
     const data = await res.json();
     const row = document.getElementById(`status-${id}`);
-    if (row) row.innerHTML = badge(data.status);
-    if (['done', 'error'].includes(data.status)) {
+    if (row) row.innerHTML = badge(data.status, data);
+    if (['done', 'error', 'duplicate'].includes(data.status)) {
       clearInterval(polls[id]);
       delete polls[id];
       await load();
@@ -1461,6 +1579,11 @@ async function upload(file) {
   const res = await fetch(withGrant('/api/upload'), { method: 'POST', body: fd });
   const data = await res.json();
   await load();
+  if (data.status === 'duplicate') {
+    const msg = `"${data.original_name}" is a duplicate of "${data.existing_name}" (uploaded ${fmtDate(data.uploaded_at)})`;
+    alert(msg);
+    return;
+  }
   startPoll(data.id);
 }
 async function delFile(id) {
@@ -1503,6 +1626,10 @@ async def _lifespan(app):
 mcp = FastMCP("rag-anywhere", host="0.0.0.0", lifespan=_lifespan)
 
 
+def _safe_filename(file_id: str, original_name: str) -> str:
+    return f"{file_id}_{re.sub(r'[^a-zA-Z0-9._-]', '_', original_name)}"
+
+
 def _build_file_record(
     *,
     file_id: str,
@@ -1510,6 +1637,8 @@ def _build_file_record(
     original_name: str,
     path: Path,
     collection_id: str,
+    content_hash: str | None = None,
+    parent_archive_id: str | None = None,
 ) -> dict:
     return {
         "id": file_id,
@@ -1531,15 +1660,32 @@ def _build_file_record(
         "derived_paths": [],
         "fallback_reason": None,
         "image_processing": None,
+        "content_hash": content_hash,
+        "parent_archive_id": parent_archive_id,
     }
 
 
 async def _store_upload_file(upload, collection_id: str) -> dict:
+    from dedup import compute_file_hash
+
     file_id = uuid4().hex[:8]
-    safe_name = f"{file_id}_{re.sub(r'[^a-zA-Z0-9._-]', '_', upload.filename)}"
+    safe_name = _safe_filename(file_id, upload.filename)
     dest = _uploads_dir / safe_name
     async with aiofiles.open(dest, "wb") as f:
         await f.write(await upload.read())
+
+    content_hash = await compute_file_hash(dest)
+    existing = await _manifest.find_by_hash(content_hash)
+    if existing:
+        dest.unlink(missing_ok=True)
+        return {
+            "id": None,
+            "status": "duplicate",
+            "duplicate_of": existing["id"],
+            "original_name": upload.filename,
+            "existing_name": existing["original_name"],
+            "uploaded_at": existing.get("uploaded_at"),
+        }
 
     record = _build_file_record(
         file_id=file_id,
@@ -1547,6 +1693,7 @@ async def _store_upload_file(upload, collection_id: str) -> dict:
         original_name=upload.filename,
         path=dest,
         collection_id=collection_id,
+        content_hash=content_hash,
     )
     await _manifest.add(record)
     _ingest_tasks[file_id] = asyncio.create_task(_ingest_background(file_id, dest))
@@ -1581,7 +1728,8 @@ async def api_upload(request: Request) -> Response:
         grant.get("metadata", {}).get("collection_id") or _default_collection_id,
     )
     result = await _store_upload_file(upload, collection_id)
-    return JSONResponse(result, status_code=202)
+    status_code = 200 if result.get("status") == "duplicate" else 202
+    return JSONResponse(result, status_code=status_code)
 
 
 @mcp.custom_route("/api/upload/{grant_token}", methods=["POST"])
@@ -1599,7 +1747,8 @@ async def api_upload_with_grant(request: Request) -> Response:
     )
     result = await _store_upload_file(upload, collection_id)
     await _grants.mark_used(grant["id"])
-    return JSONResponse(result, status_code=202)
+    status_code = 200 if result.get("status") == "duplicate" else 202
+    return JSONResponse(result, status_code=status_code)
 
 
 @mcp.custom_route("/api/files/{file_id}/status", methods=["GET"])
@@ -1610,21 +1759,24 @@ async def api_file_status(request: Request) -> Response:
     record = await _manifest.get(request.path_params["file_id"])
     if not record:
         return JSONResponse({"error": "not found"}, status_code=404)
-    return JSONResponse(
-        {
-            k: record.get(k)
-            for k in (
-                "id",
-                "status",
-                "error",
-                "ingested_at",
-                "modality",
-                "ingest_path",
-                "engine",
-                "fallback_reason",
-            )
-        }
-    )
+    info = {
+        k: record.get(k)
+        for k in (
+            "id",
+            "status",
+            "error",
+            "ingested_at",
+            "modality",
+            "ingest_path",
+            "engine",
+            "fallback_reason",
+            "video_stage",
+        )
+    }
+    if record.get("modality") == "archive":
+        info["archive_progress"] = record.get("archive_progress")
+        info["child_ids"] = record.get("child_ids")
+    return JSONResponse(info)
 
 
 @mcp.custom_route("/api/files/{file_id}", methods=["DELETE"])
@@ -1651,6 +1803,30 @@ async def api_delete_file(request: Request) -> Response:
             await _document_engine.delete(record.get("engine_doc_id"))
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+    # Cascade delete children of an archive
+    if record.get("modality") == "archive":
+        children = await _manifest.remove_by_parent(file_id)
+        for child in children:
+            child_task = _ingest_tasks.pop(child["id"], None)
+            if child_task:
+                child_task.cancel()
+            if child.get("engine") == "video":
+                try:
+                    await _video_engine.delete(child.get("engine_doc_id"))
+                except Exception:
+                    pass
+            elif child.get("engine") == "document":
+                try:
+                    await _document_engine.delete(child.get("engine_doc_id"))
+                except Exception:
+                    pass
+            for p in [child.get("path"), *(child.get("derived_paths") or [])]:
+                if p:
+                    try:
+                        Path(p).unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
     removed = await _manifest.remove(file_id)
     for path_str in [record.get("path"), *(record.get("derived_paths") or [])]:
@@ -1697,70 +1873,51 @@ async def api_health(request: Request) -> Response:
 
 
 async def _ingest_paths(paths: list[str], recursive: bool = True) -> dict:
+    from dedup import compute_file_hash
+
     added = []
+    skipped = []
     errors = []
+
+    async def _ingest_single(file_path: Path):
+        content_hash = await compute_file_hash(file_path)
+        existing = await _manifest.find_by_hash(content_hash)
+        if existing:
+            skipped.append({
+                "path": str(file_path),
+                "duplicate_of": existing["id"],
+                "original_name": existing["original_name"],
+            })
+            return
+
+        file_id = uuid4().hex[:8]
+        record = _build_file_record(
+            file_id=file_id,
+            safe_name=file_path.name,
+            original_name=file_path.name,
+            path=file_path,
+            collection_id=_default_collection_id,
+            content_hash=content_hash,
+        )
+        record["status"] = "queued"
+        await _manifest.add(record)
+        await _ingest_background(file_id, file_path)
+        added.append(str(file_path))
+
     for item in paths:
         path = Path(item)
         try:
             if path.is_dir():
                 for child in path.rglob("*") if recursive else path.glob("*"):
                     if child.is_file():
-                        file_id = uuid4().hex[:8]
-                        record = {
-                            "id": file_id,
-                            "name": child.name,
-                            "original_name": child.name,
-                            "path": str(child),
-                            "size_bytes": child.stat().st_size,
-                            "uploaded_at": _iso_now(),
-                            "status": "queued",
-                            "ingested_at": None,
-                            "error": None,
-                            "collection_id": _default_collection_id,
-                            "modality": _classify_file(child),
-                            "ingest_path": "pending",
-                            "engine": None,
-                            "engine_doc_id": None,
-                            "queryable": False,
-                            "capabilities": [],
-                            "derived_paths": [],
-                            "fallback_reason": None,
-                            "image_processing": None,
-                        }
-                        await _manifest.add(record)
-                        await _ingest_background(file_id, child)
-                        added.append(str(child))
+                        await _ingest_single(child)
             elif path.is_file():
-                file_id = uuid4().hex[:8]
-                record = {
-                    "id": file_id,
-                    "name": path.name,
-                    "original_name": path.name,
-                    "path": str(path),
-                    "size_bytes": path.stat().st_size,
-                    "uploaded_at": _iso_now(),
-                    "status": "queued",
-                    "ingested_at": None,
-                    "error": None,
-                    "collection_id": _default_collection_id,
-                    "modality": _classify_file(path),
-                    "ingest_path": "pending",
-                    "engine": None,
-                    "engine_doc_id": None,
-                    "queryable": False,
-                    "capabilities": [],
-                    "derived_paths": [],
-                    "fallback_reason": None,
-                    "image_processing": None,
-                }
-                await _manifest.add(record)
-                await _ingest_background(file_id, path)
-                added.append(str(path))
+                await _ingest_single(path)
             else:
                 errors.append(f"Path not found: {item}")
         except Exception as exc:
             errors.append(f"{item}: {exc}")
-    return {"added": added, "errors": errors}
+    return {"added": added, "skipped": skipped, "errors": errors}
 
 
 async def _document_query_enabled(records: list[dict], target: str) -> bool:
