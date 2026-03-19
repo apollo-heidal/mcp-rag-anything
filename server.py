@@ -21,18 +21,17 @@ from pathlib import Path
 from urllib.parse import quote
 from uuid import uuid4
 
-import nest_asyncio
-
-nest_asyncio.apply()
-
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
 import aiofiles
 import httpx
+import nest_asyncio
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
+
+nest_asyncio.apply()
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 load_dotenv(Path(__file__).parent / ".env", override=False)
 
@@ -88,9 +87,7 @@ _vision_probe_state = {
     "response_preview": None,
 }
 _VISION_PROBE_TTL_SECONDS = 60
-_VISION_PROBE_IMAGE = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X6Z0AAAAASUVORK5CYII="
-)
+_VISION_PROBE_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X6Z0AAAAASUVORK5CYII="
 
 
 def _get_env(key: str, default: str) -> str:
@@ -150,7 +147,9 @@ def _mint_grant_token(grant_id: str, grant_type: str, expires_at: str) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
-    encoded_payload = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("utf-8").rstrip("=")
+    encoded_payload = (
+        base64.urlsafe_b64encode(payload.encode("utf-8")).decode("utf-8").rstrip("=")
+    )
     signature = _sign_grant_payload(encoded_payload)
     return f"{encoded_payload}.{signature}"
 
@@ -293,7 +292,9 @@ async def _get_st_model():
         if _st_model is None:
             from sentence_transformers import SentenceTransformer
 
-            st_model_name = _get_env("ST_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+            st_model_name = _get_env(
+                "ST_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+            )
             _st_model = await asyncio.to_thread(SentenceTransformer, st_model_name)
     return _st_model
 
@@ -303,7 +304,9 @@ async def _build_vision_func():
         "VISION_API_BASE", _get_env("LLM_API_BASE", "http://localhost:12434/engines/v1")
     )
     vision_model = _get_env("VISION_MODEL", "docker.io/local/qwen3.5-2b-vlm:latest")
-    api_key = _get_env("VISION_API_KEY", _get_env("OPENAI_API_KEY", "docker-model-runner"))
+    api_key = _get_env(
+        "VISION_API_KEY", _get_env("OPENAI_API_KEY", "docker-model-runner")
+    )
 
     async def vision_func(prompt, image_data=None, system_prompt=None, **kwargs):
         if not image_data:
@@ -317,13 +320,18 @@ async def _build_vision_func():
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": image_url, "detail": "high"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_url, "detail": "high"},
+                    },
                     {"type": "text", "text": prompt},
                 ],
             }
         )
 
-        max_tokens = kwargs.get("max_completion_tokens") or kwargs.get("max_tokens") or 1024
+        max_tokens = (
+            kwargs.get("max_completion_tokens") or kwargs.get("max_tokens") or 1024
+        )
         try:
             content = await _call_openai_chat(
                 api_base=api_base,
@@ -379,7 +387,8 @@ async def _probe_vision_model(force: bool = False) -> dict:
         not force
         and checked_at
         and _vision_probe_state.get("model") == vision_model
-        and (now - datetime.fromisoformat(checked_at)).total_seconds() < _VISION_PROBE_TTL_SECONDS
+        and (now - datetime.fromisoformat(checked_at)).total_seconds()
+        < _VISION_PROBE_TTL_SECONDS
     ):
         return dict(_vision_probe_state)
 
@@ -389,7 +398,8 @@ async def _probe_vision_model(force: bool = False) -> dict:
             not force
             and checked_at
             and _vision_probe_state.get("model") == vision_model
-            and (now - datetime.fromisoformat(checked_at)).total_seconds() < _VISION_PROBE_TTL_SECONDS
+            and (now - datetime.fromisoformat(checked_at)).total_seconds()
+            < _VISION_PROBE_TTL_SECONDS
         ):
             return dict(_vision_probe_state)
 
@@ -443,15 +453,19 @@ class StrictImageModalProcessor:
         }
 
     def __getattr__(self, name):
+        """
+        _getattr is this working?
+        """
         return getattr(self._processor, name)
 
     async def generate_description_only(self, *args, **kwargs):
         self.attempted += 1
         modal_content = args[0] if args else kwargs.get("modal_content")
         try:
-            enhanced_caption, entity_info = await self._processor.generate_description_only(
-                *args, **kwargs
-            )
+            (
+                enhanced_caption,
+                entity_info,
+            ) = await self._processor.generate_description_only(*args, **kwargs)
         except Exception:
             self.failed += 1
             raise
@@ -463,7 +477,9 @@ class StrictImageModalProcessor:
             modal_content
         ):
             self.failed += 1
-            raise RuntimeError("Image metadata extraction fell back to placeholder content")
+            raise RuntimeError(
+                "Image metadata extraction fell back to placeholder content"
+            )
 
         self.succeeded += 1
         return enhanced_caption, entity_info
@@ -479,8 +495,12 @@ class StrictRAGAnything:
     async def _ensure_lightrag_initialized(self):
         await self._rag._ensure_lightrag_initialized()
         image_processor = self._rag.modal_processors.get("image")
-        if image_processor and not isinstance(image_processor, StrictImageModalProcessor):
-            self._rag.modal_processors["image"] = StrictImageModalProcessor(image_processor)
+        if image_processor and not isinstance(
+            image_processor, StrictImageModalProcessor
+        ):
+            self._rag.modal_processors["image"] = StrictImageModalProcessor(
+                image_processor
+            )
 
     def reset_image_processing_state(self) -> None:
         image_processor = self._rag.modal_processors.get("image")
@@ -498,8 +518,10 @@ class StrictRAGAnything:
         self.reset_image_processing_state()
         await self._rag.process_document_complete(*args, **kwargs)
         summary = self.image_processing_summary()
-        if _vision_required() and summary["attempted"] and (
-            summary["failed"] or summary["succeeded"] != summary["attempted"]
+        if (
+            _vision_required()
+            and summary["attempted"]
+            and (summary["failed"] or summary["succeeded"] != summary["attempted"])
         ):
             raise RuntimeError(
                 "Image metadata extraction failed for one or more document images"
@@ -516,6 +538,7 @@ async def _get_rag():
 
         from lightrag.utils import EmbeddingFunc
         from raganything import RAGAnything, RAGAnythingConfig
+
         working_dir = _get_env("RAG_WORKING_DIR", str(Path.home() / ".rag_storage"))
         output_dir = _get_env("RAG_OUTPUT_DIR", str(Path(working_dir) / "output"))
 
@@ -540,9 +563,7 @@ async def _get_rag():
             )
 
         embedding_dim = int(
-            _get_env(
-                "EMBEDDING_DIM", str(st_model.get_sentence_embedding_dimension())
-            )
+            _get_env("EMBEDDING_DIM", str(st_model.get_sentence_embedding_dimension()))
         )
         embed_func = EmbeddingFunc(
             embedding_dim=embedding_dim, max_token_size=8192, func=_embed
@@ -574,7 +595,10 @@ async def _get_asr_pipeline():
         if device == "auto":
             if torch.cuda.is_available():
                 device = 0
-            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            elif (
+                getattr(torch.backends, "mps", None)
+                and torch.backends.mps.is_available()
+            ):
                 device = "mps"
             else:
                 device = -1
@@ -746,7 +770,10 @@ class FileManifest:
         for record in records:
             if not record.get("queryable"):
                 continue
-            if allowed_collections and record.get("collection_id") not in allowed_collections:
+            if (
+                allowed_collections
+                and record.get("collection_id") not in allowed_collections
+            ):
                 continue
             engine = record.get("engine")
             if target == "document" and engine != "document":
@@ -808,7 +835,9 @@ class GrantStore:
                 "type": grant_type,
                 "subject": subject,
                 "issued_at": _iso_now(),
-                "expires_at": datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
+                "expires_at": datetime.fromtimestamp(
+                    expires_at, tz=timezone.utc
+                ).isoformat(),
                 "metadata": metadata or {},
                 "max_uses": max_uses,
                 "uses": 0,
@@ -817,7 +846,9 @@ class GrantStore:
             }
             grants[grant_id] = grant
             await self._save(grants)
-            grant["token"] = _mint_grant_token(grant_id, grant_type, grant["expires_at"])
+            grant["token"] = _mint_grant_token(
+                grant_id, grant_type, grant["expires_at"]
+            )
             return grant
 
     async def get_valid(self, token: str, expected_type: str) -> dict:
@@ -864,10 +895,14 @@ def _request_grant_token(request: Request) -> str | None:
     return request.query_params.get("grant")
 
 
-async def _require_grant(request: Request, expected_type: str) -> tuple[dict | None, Response | None]:
+async def _require_grant(
+    request: Request, expected_type: str
+) -> tuple[dict | None, Response | None]:
     token = _request_grant_token(request)
     if not token:
-        return None, JSONResponse({"error": f"missing {expected_type} grant"}, status_code=401)
+        return None, JSONResponse(
+            {"error": f"missing {expected_type} grant"}, status_code=401
+        )
     try:
         grant = await _grants.get_valid(token, expected_type)
     except Exception as exc:
@@ -900,7 +935,10 @@ async def _issue_upload_link(
         grant_type="upload",
         subject=subject,
         ttl_seconds=ttl,
-        metadata={"collection_id": collection_id or _default_collection_id, "filename": filename},
+        metadata={
+            "collection_id": collection_id or _default_collection_id,
+            "filename": filename,
+        },
         max_uses=1,
     )
     grant["upload_url"] = f"{_base_url()}/api/upload/{quote(grant['token'])}"
@@ -929,7 +967,9 @@ class DocumentEngineAdapter:
             try:
                 await rag.lightrag.adelete_by_doc_id(doc_id)
             except Exception as cleanup_exc:
-                logging.warning("Failed to roll back document %s: %s", doc_id, cleanup_exc)
+                logging.warning(
+                    "Failed to roll back document %s: %s", doc_id, cleanup_exc
+                )
             raise
         summary = rag.image_processing_summary()
         capabilities = ["text"]
@@ -996,7 +1036,9 @@ class VideoEngineAdapter:
                 lambda: st_model.encode(texts, show_progress_bar=False)
             )
 
-        async def complete_func(model_name, prompt, system_prompt=None, history_messages=None, **kwargs):
+        async def complete_func(
+            model_name, prompt, system_prompt=None, history_messages=None, **kwargs
+        ):
             messages = list(history_messages or [])
             if system_prompt:
                 messages.insert(0, {"role": "system", "content": system_prompt})
@@ -1017,7 +1059,9 @@ class VideoEngineAdapter:
 
         self._llm_config = LLMConfig(
             embedding_func_raw=embed_func,
-            embedding_model_name=_get_env("ST_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
+            embedding_model_name=_get_env(
+                "ST_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+            ),
             embedding_dim=embedding_dim,
             embedding_max_token_size=8192,
             embedding_batch_num=8,
@@ -1045,7 +1089,11 @@ class VideoEngineAdapter:
                 return engine
 
             from videorag import VideoRAG
-            from videorag._storage import JsonKVStorage, NanoVectorDBStorage, NetworkXStorage
+            from videorag._storage import (
+                JsonKVStorage,
+                NanoVectorDBStorage,
+                NetworkXStorage,
+            )
 
             llm_config = await self._get_llm_config()
             workspace = self._workspace(file_id)
@@ -1078,7 +1126,9 @@ class VideoEngineAdapter:
             "vision": vision_health,
         }
 
-    async def ingest_file(self, file_id: str, file_path: Path, collection_id: str) -> dict:
+    async def ingest_file(
+        self, file_id: str, file_path: Path, collection_id: str
+    ) -> dict:
         if not self.configured():
             raise RuntimeError("Video engine not configured")
         engine = await self._get_engine(file_id)
@@ -1135,7 +1185,13 @@ class VideoEngineAdapter:
                         "segment_id": ref.get("segment_id"),
                     }
                 )
-            per_video.append({"file_id": record["id"], "answer": answer, "references": references[:top_k]})
+            per_video.append(
+                {
+                    "file_id": record["id"],
+                    "answer": answer,
+                    "references": references[:top_k],
+                }
+            )
         return QueryEnvelope(
             answer="\n\n".join(answer for answer in answers if answer),
             hits=hits[:top_k],
@@ -1538,7 +1594,9 @@ async def api_upload_with_grant(request: Request) -> Response:
 
     form = await request.form()
     upload = form["file"]
-    collection_id = grant.get("metadata", {}).get("collection_id") or _default_collection_id
+    collection_id = (
+        grant.get("metadata", {}).get("collection_id") or _default_collection_id
+    )
     result = await _store_upload_file(upload, collection_id)
     await _grants.mark_used(grant["id"])
     return JSONResponse(result, status_code=202)
@@ -1615,11 +1673,17 @@ async def api_health(request: Request) -> Response:
             "video_engine_enabled": _video_engine_enabled,
             "control_plane": {
                 "base_url": _base_url(),
-                "ui_session_ttl_seconds": int(_get_env("UI_SESSION_TTL_SECONDS", "900")),
-                "upload_link_ttl_seconds": int(_get_env("UPLOAD_LINK_TTL_SECONDS", "900")),
+                "ui_session_ttl_seconds": int(
+                    _get_env("UI_SESSION_TTL_SECONDS", "900")
+                ),
+                "upload_link_ttl_seconds": int(
+                    _get_env("UPLOAD_LINK_TTL_SECONDS", "900")
+                ),
             },
             "video_engine": video_health,
-            "vision_model": _get_env("VISION_MODEL", "docker.io/local/qwen3.5-2b-vlm:latest"),
+            "vision_model": _get_env(
+                "VISION_MODEL", "docker.io/local/qwen3.5-2b-vlm:latest"
+            ),
             "vision_api_base": _get_env(
                 "VISION_API_BASE",
                 _get_env("LLM_API_BASE", "http://localhost:12434/engines/v1"),
@@ -1742,7 +1806,9 @@ async def _fallback_hits(records: list[dict]) -> list[dict]:
         if record.get("ingest_path") != "audio-transcript":
             continue
         if record.get("transcript_chunks"):
-            hits.extend(_transcript_hits(record, {"chunks": record["transcript_chunks"]}))
+            hits.extend(
+                _transcript_hits(record, {"chunks": record["transcript_chunks"]})
+            )
     return hits[:8]
 
 
@@ -1767,7 +1833,9 @@ async def query(
         hits.extend(await _fallback_hits(selected_records))
 
     if await _video_query_enabled(selected_records, target):
-        video_records = [record for record in selected_records if record.get("engine") == "video"]
+        video_records = [
+            record for record in selected_records if record.get("engine") == "video"
+        ]
         video_envelope = await _video_engine.query(query, video_records, top_k)
         if video_envelope.answer or video_envelope.hits:
             envelopes.append(video_envelope)
