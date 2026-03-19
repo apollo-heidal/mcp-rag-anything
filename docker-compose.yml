@@ -18,7 +18,9 @@ services:
             - VISION_REQUIRED=${VISION_REQUIRED:-true}
             - VIDEO_ENGINE_ENABLED=${VIDEO_ENGINE_ENABLED:-true}
             - VIDEO_SEGMENT_LENGTH=${VIDEO_SEGMENT_LENGTH:-30}
-            - AUDIO_TRANSCRIBE_MODEL=${AUDIO_TRANSCRIBE_MODEL:-openai/whisper-small}
+            - AUDIO_TRANSCRIBE_MODEL=${AUDIO_TRANSCRIBE_MODEL}
+            - WHISPER_API_BASE=${WHISPER_API_BASE:-http://whisper:8080}
+            - EMBEDDING_DIM=${EMBEDDING_DIM}
             # MinerU: offload VLM inference to Docker Model Runner (uses Metal on host)
             # If MinerU needs a separate VLM model, provision it through the local Docker Model Runner workflow.
             - MINERU_BACKEND=pipeline
@@ -32,11 +34,39 @@ services:
             embedding:
                 endpoint_var: EMBEDDING_API_BASE
                 model_var: EMBEDDING_MODEL
+        depends_on:
+            whisper:
+                condition: service_healthy
+
+    whisper:
+        build:
+            context: .
+            dockerfile: whisper.Dockerfile
+        command:
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8080"
+            - -m
+            - /models/ggml-small.bin
+            - -t
+            - "4"
+            - --convert
+        volumes:
+            - ./whisper_models:/models
+        ports:
+            - "8080:8080"
+        healthcheck:
+            test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+            interval: 10s
+            timeout: 5s
+            retries: 12
+            start_period: 30s
 
 models:
     llm:
-        model: ${LLM_MODEL:-hf.co/unsloth/Qwen3.5-2B-GGUF}
+        model: ${LLM_MODEL}
     vision:
-        model: ${VISION_MODEL:-docker.io/local/qwen3.5-2b-vlm:latest}
+        model: ${VISION_MODEL}
     embedding:
-        model: ${EMBEDDING_MODEL:-hf.co/unsloth/Qwen3-Embedding-0.6B}
+        model: ${EMBEDDING_MODEL}

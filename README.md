@@ -24,9 +24,9 @@ Required prestart step:
 ```bash
 mkdir -p model_assets
 curl -L --fail -o model_assets/mmproj-F16.gguf \
-  https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/mmproj-F16.gguf
+  https://hf.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/mmproj-F16.gguf
 docker model package \
-  --gguf "$HOME/.docker/models/bundles/sha256/bf0404c6cadfc3a56220bfcd6daed69533348212e68471675238f2a6b706de07/model/model.gguf" \
+  --from hf.co/unsloth/Qwen3.5-2B-GGUF \
   --mmproj "$PWD/model_assets/mmproj-F16.gguf" \
   docker.io/local/qwen3.5-2b-vlm:latest
 ```

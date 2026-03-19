@@ -78,8 +78,8 @@ _vision_lock = asyncio.Lock()
 _vision_probe_lock = asyncio.Lock()
 _asr_pipeline = None
 _asr_lock = asyncio.Lock()
-_st_model = None
-_st_lock = asyncio.Lock()
+_embed_func_cache = None
+_embed_lock = asyncio.Lock()
 _vision_probe_state = {
     "checked_at": None,
     "ok": None,
@@ -287,19 +287,66 @@ async def _get_llm_func():
     return _llm_func
 
 
-async def _get_st_model():
-    global _st_model
-    if _st_model is not None:
-        return _st_model
-    async with _st_lock:
-        if _st_model is None:
-            from sentence_transformers import SentenceTransformer
+async def _build_embed_func() -> tuple:
+    """Return (embed_async_func, embedding_dim).
 
-            st_model_name = _get_env(
-                "ST_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-            )
-            _st_model = await asyncio.to_thread(SentenceTransformer, st_model_name)
-    return _st_model
+    Prefers the DMR embeddings API (EMBEDDING_API_BASE + EMBEDDING_MODEL).
+    Falls back to a local SentenceTransformer if the API is not configured.
+    """
+    import numpy as np
+
+    api_base = _get_env("EMBEDDING_API_BASE", "")
+    embed_model = _get_env("EMBEDDING_MODEL", "")
+
+    if api_base and embed_model:
+        import httpx
+
+        async def _embed_via_api(texts: list[str]):
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    f"{api_base}embeddings",
+                    json={"model": embed_model, "input": texts},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            sorted_data = sorted(data["data"], key=lambda d: d["index"])
+            return np.array([d["embedding"] for d in sorted_data], dtype=np.float32)
+
+        # Probe the API to discover the actual embedding dimension
+        probe_dim = int(_get_env("EMBEDDING_DIM", "0"))
+        if not probe_dim:
+            import httpx as _httpx
+
+            async with _httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    f"{api_base}embeddings",
+                    json={"model": embed_model, "input": ["dim probe"]},
+                )
+                resp.raise_for_status()
+                probe_dim = len(resp.json()["data"][0]["embedding"])
+        logging.info(
+            "Using DMR embeddings API: model=%s dim=%d", embed_model, probe_dim
+        )
+        return _embed_via_api, probe_dim
+
+    # Fallback: local SentenceTransformer (CPU)
+    logging.warning(
+        "EMBEDDING_API_BASE not configured — falling back to local "
+        "SentenceTransformer on CPU. This is significantly slower than "
+        "using Docker Model Runner."
+    )
+    from sentence_transformers import SentenceTransformer
+
+    st_model_name = _get_env("ST_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    st_model = await asyncio.to_thread(SentenceTransformer, st_model_name)
+    dim = st_model.get_sentence_embedding_dimension()
+
+    async def _embed_local(texts: list[str]):
+        return await asyncio.to_thread(
+            lambda: st_model.encode(texts, show_progress_bar=False)
+        )
+
+    return _embed_local, dim
 
 
 async def _build_vision_func():
@@ -558,18 +605,9 @@ async def _get_rag():
         llm_func = await _get_llm_func()
         vision_func = await _get_vision_func()
 
-        st_model = await _get_st_model()
-
-        async def _embed(texts: list[str]):
-            return await asyncio.to_thread(
-                lambda: st_model.encode(texts, show_progress_bar=False)
-            )
-
-        embedding_dim = int(
-            _get_env("EMBEDDING_DIM", str(st_model.get_sentence_embedding_dimension()))
-        )
+        embed_fn, embedding_dim = await _build_embed_func()
         embed_func = EmbeddingFunc(
-            embedding_dim=embedding_dim, max_token_size=8192, func=_embed
+            embedding_dim=embedding_dim, max_token_size=8192, func=embed_fn
         )
 
         rag = RAGAnything(
@@ -582,7 +620,12 @@ async def _get_rag():
         return _rag
 
 
-async def _get_asr_pipeline():
+def _whisper_api_base() -> str:
+    return _get_env("WHISPER_API_BASE", "")
+
+
+async def _get_asr_model():
+    """Fallback: load local PyTorch Whisper when no API is configured."""
     global _asr_pipeline
     if _asr_pipeline is not None:
         return _asr_pipeline
@@ -590,30 +633,35 @@ async def _get_asr_pipeline():
         if _asr_pipeline is not None:
             return _asr_pipeline
 
+        logging.warning(
+            "WHISPER_API_BASE not configured — falling back to local "
+            "PyTorch Whisper on CPU. This is significantly slower than "
+            "using a whisper.cpp server with Metal/GPU acceleration."
+        )
+
         import torch
-        from transformers import pipeline
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
         model_name = _get_env("AUDIO_TRANSCRIBE_MODEL", "openai/whisper-small")
         device = _get_env("AUDIO_TRANSCRIBE_DEVICE", "auto")
         if device == "auto":
             if torch.cuda.is_available():
-                device = 0
+                device = "cuda"
             elif (
                 getattr(torch.backends, "mps", None)
                 and torch.backends.mps.is_available()
             ):
                 device = "mps"
             else:
-                device = -1
-        elif device == "cpu":
-            device = -1
+                device = "cpu"
 
-        _asr_pipeline = await asyncio.to_thread(
-            pipeline,
-            "automatic-speech-recognition",
-            model=model_name,
-            device=device,
-        )
+        def _load():
+            processor = WhisperProcessor.from_pretrained(model_name)
+            model = WhisperForConditionalGeneration.from_pretrained(model_name)
+            model.to(device)
+            return model, processor
+
+        _asr_pipeline = await asyncio.to_thread(_load)
     return _asr_pipeline
 
 
@@ -653,34 +701,99 @@ async def _extract_audio_from_video(file_id: str, video_path: Path) -> Path:
     return output_path
 
 
-async def _transcribe_audio(audio_path: Path) -> dict:
-    asr = await _get_asr_pipeline()
+async def _transcribe_audio_via_api(audio_path: Path) -> dict:
+    """Transcribe using an OpenAI-compatible whisper API endpoint."""
+    import httpx
+
+    api_base = _whisper_api_base()
+    url = f"{api_base}/inference"
+    async with httpx.AsyncClient(timeout=600) as client:
+        with open(audio_path, "rb") as f:
+            resp = await client.post(
+                url,
+                files={"file": (audio_path.name, f, "audio/wav")},
+                data={
+                    "model": "whisper-1",
+                    "response_format": "verbose_json",
+                },
+            )
+        resp.raise_for_status()
+    data = resp.json()
+
+    full_text = data.get("text", "").strip()
+    chunks = []
+    for seg in data.get("segments", []):
+        chunks.append({
+            "start": seg.get("start"),
+            "end": seg.get("end"),
+            "text": seg.get("text", "").strip(),
+        })
+    if not chunks and full_text:
+        chunks.append({"start": None, "end": None, "text": full_text})
+    return {"text": full_text, "chunks": chunks}
+
+
+async def _transcribe_audio_local(audio_path: Path) -> dict:
+    """Fallback: transcribe using local PyTorch Whisper model."""
+    import torch
+    from transformers.pipelines.audio_utils import ffmpeg_read
+
+    model, processor = await _get_asr_model()
+    device = next(model.parameters()).device
 
     def run():
-        return asr(
-            str(audio_path),
+        with open(audio_path, "rb") as f:
+            audio = ffmpeg_read(f.read(), sampling_rate=16000)
+        inputs = processor(
+            audio,
+            return_tensors="pt",
+            sampling_rate=16000,
+            return_attention_mask=True,
+            truncation=False,
+            padding="max_length",
+        )
+        inputs = inputs.to(device)
+        generated_ids = model.generate(
+            **inputs,
             return_timestamps=True,
-            chunk_length_s=int(_get_env("AUDIO_TRANSCRIBE_CHUNK_SECONDS", "30")),
-            batch_size=int(_get_env("AUDIO_TRANSCRIBE_BATCH_SIZE", "8")),
+            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            compression_ratio_threshold=1.35,
+            logprob_threshold=-1.0,
         )
+        decoded = processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+            output_offsets=True,
+        )
+        return decoded
 
-    result = await asyncio.to_thread(run)
+    decoded = await asyncio.to_thread(run)
+
     chunks = []
-    for chunk in result.get("chunks", []) or []:
-        timestamp = chunk.get("timestamp") or (None, None)
-        start, end = timestamp
-        chunks.append(
-            {
-                "start": start,
-                "end": end,
-                "text": (chunk.get("text") or "").strip(),
-            }
-        )
+    full_text = ""
+    if decoded:
+        entry = decoded[0]
+        if isinstance(entry, dict):
+            full_text = entry.get("text", "").strip()
+            for offset in entry.get("offsets", []):
+                chunks.append({
+                    "start": offset.get("timestamp", (None, None))[0],
+                    "end": offset.get("timestamp", (None, None))[1],
+                    "text": offset.get("text", "").strip(),
+                })
+        else:
+            full_text = str(entry).strip()
 
-    if not chunks and result.get("text"):
-        chunks.append({"start": None, "end": None, "text": result["text"].strip()})
+    if not chunks and full_text:
+        chunks.append({"start": None, "end": None, "text": full_text})
 
-    return {"text": (result.get("text") or "").strip(), "chunks": chunks}
+    return {"text": full_text, "chunks": chunks}
+
+
+async def _transcribe_audio(audio_path: Path) -> dict:
+    if _whisper_api_base():
+        return await _transcribe_audio_via_api(audio_path)
+    return await _transcribe_audio_local(audio_path)
 
 
 async def _write_transcript_artifact(
@@ -1048,16 +1161,13 @@ class VideoEngineAdapter:
 
         from videorag._llm import LLMConfig
 
-        st_model = await _get_st_model()
-        embedding_dim = st_model.get_sentence_embedding_dimension()
+        embed_fn, embedding_dim = await _build_embed_func()
         api_base = _get_env("LLM_API_BASE", "http://localhost:12434/engines/v1")
-        llm_model = _get_env("LLM_MODEL", "hf.co/unsloth/Qwen3.5-2B-GGUF")
+        llm_model = _get_env("LLM_MODEL", "docker.io/local/qwen3.5-2b-vlm:latest")
         api_key = _get_env("OPENAI_API_KEY", "docker-model-runner")
 
         async def embed_func(texts: list[str], **kwargs):
-            return await asyncio.to_thread(
-                lambda: st_model.encode(texts, show_progress_bar=False)
-            )
+            return await embed_fn(texts)
 
         async def complete_func(
             model_name, prompt, system_prompt=None, history_messages=None, **kwargs
@@ -1082,9 +1192,7 @@ class VideoEngineAdapter:
 
         self._llm_config = LLMConfig(
             embedding_func_raw=embed_func,
-            embedding_model_name=_get_env(
-                "ST_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-            ),
+            embedding_model_name=_get_env("EMBEDDING_MODEL", "ai/mxbai-embed-large"),
             embedding_dim=embedding_dim,
             embedding_max_token_size=8192,
             embedding_batch_num=8,
@@ -1469,6 +1577,15 @@ _UI_HTML = """<!DOCTYPE html>
     font-size: 0.75rem; line-height: 1.4; white-space: pre-wrap; word-break: break-word; z-index: 10;
   }
   .status-detail { display: block; font-size: 0.65rem; color: var(--muted); margin-top: 2px; }
+  .upload-status { display: none; margin-top: 1.25rem; text-align: left; }
+  .upload-status.active { display: block; }
+  .upload-label { font-size: 0.8rem; color: var(--text); margin-bottom: 0.4rem; }
+  .upload-bar-track { width: 100%; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+  .upload-bar-fill { height: 100%; width: 0%; background: var(--accent); border-radius: 3px; transition: width 0.15s ease; }
+  .upload-pct { font-size: 0.7rem; color: var(--muted); margin-top: 0.25rem; text-align: right; }
+  .upload-error { display: none; margin-top: 1rem; padding: 0.6rem 1rem; background: rgba(239,68,68,0.12);
+    border: 1px solid var(--error); border-radius: var(--radius); color: var(--error); font-size: 0.8rem; text-align: left; }
+  .upload-error.active { display: block; }
 </style>
 </head>
 <body>
@@ -1479,6 +1596,12 @@ _UI_HTML = """<!DOCTYPE html>
   <div>&#128249; Drop files here</div>
   <p>Documents, audio, video, or ZIP archives. Video ingest requires native video indexing and returns timestamped segments.</p>
   <label class="drop-btn">Browse files<input type="file" id="fileInput" multiple hidden></label>
+  <div class="upload-status" id="uploadStatus">
+    <div class="upload-label" id="uploadLabel">Uploading…</div>
+    <div class="upload-bar-track"><div class="upload-bar-fill" id="uploadFill"></div></div>
+    <div class="upload-pct" id="uploadPct">0%</div>
+  </div>
+  <div class="upload-error" id="uploadError"></div>
 </div>
 
 <div class="table-wrap">
@@ -1573,18 +1696,97 @@ function startPoll(id) {
     }
   }, 2000);
 }
-async function upload(file) {
+const uploadState = { active: 0, loaded: 0, total: 0, perFile: {} };
+const uploadStatusEl = document.getElementById('uploadStatus');
+const uploadLabel = document.getElementById('uploadLabel');
+const uploadFill = document.getElementById('uploadFill');
+const uploadPct = document.getElementById('uploadPct');
+const uploadErrorEl = document.getElementById('uploadError');
+let errorTimer = null;
+
+function showUploadError(msg) {
+  uploadErrorEl.textContent = msg;
+  uploadErrorEl.classList.add('active');
+  if (errorTimer) clearTimeout(errorTimer);
+  errorTimer = setTimeout(() => uploadErrorEl.classList.remove('active'), 5000);
+}
+
+function updateProgress() {
+  const total = Object.values(uploadState.perFile).reduce((s, f) => s + f.total, 0);
+  const loaded = Object.values(uploadState.perFile).reduce((s, f) => s + f.loaded, 0);
+  const pct = total > 0 ? Math.round((loaded / total) * 100) : 0;
+  uploadFill.style.width = pct + '%';
+  uploadPct.textContent = pct + '%';
+  if (uploadState.active === 1) {
+    const name = Object.values(uploadState.perFile).find(f => !f.done)?.name || '';
+    uploadLabel.textContent = 'Uploading ' + name + '\u2026';
+  } else {
+    uploadLabel.textContent = 'Uploading ' + uploadState.active + ' files\u2026';
+  }
+}
+
+function upload(file) {
+  const fid = Math.random().toString(36).slice(2, 10);
+  uploadState.perFile[fid] = { name: file.name, loaded: 0, total: file.size || 1, done: false };
+  uploadState.active++;
+  uploadStatusEl.classList.add('active');
+  updateProgress();
+
   const fd = new FormData();
   fd.append('file', file);
-  const res = await fetch(withGrant('/api/upload'), { method: 'POST', body: fd });
-  const data = await res.json();
-  await load();
-  if (data.status === 'duplicate') {
-    const msg = `"${data.original_name}" is a duplicate of "${data.existing_name}" (uploaded ${fmtDate(data.uploaded_at)})`;
-    alert(msg);
-    return;
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', withGrant('/api/upload'));
+
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable) {
+      uploadState.perFile[fid].loaded = e.loaded;
+      uploadState.perFile[fid].total = e.total;
+      updateProgress();
+    }
+  };
+
+  function finish() {
+    uploadState.perFile[fid].done = true;
+    uploadState.perFile[fid].loaded = uploadState.perFile[fid].total;
+    uploadState.active--;
+    if (uploadState.active <= 0) {
+      uploadState.active = 0;
+      uploadStatusEl.classList.remove('active');
+      uploadState.perFile = {};
+    }
+    updateProgress();
   }
-  startPoll(data.id);
+
+  xhr.onload = async () => {
+    finish();
+    if (xhr.status >= 400) {
+      let msg = 'Upload failed (' + xhr.status + ')';
+      try { msg = JSON.parse(xhr.responseText).detail || msg; } catch {}
+      showUploadError(msg);
+      return;
+    }
+    let data;
+    try { data = JSON.parse(xhr.responseText); } catch { await load(); return; }
+    await load();
+    if (data.status === 'duplicate') {
+      const msg = '"' + data.original_name + '" is a duplicate of "' + data.existing_name + '" (uploaded ' + fmtDate(data.uploaded_at) + ')';
+      alert(msg);
+      return;
+    }
+    startPoll(data.id);
+  };
+
+  xhr.onerror = () => {
+    finish();
+    showUploadError('Upload failed for "' + file.name + '" \u2014 network error.');
+  };
+
+  xhr.ontimeout = () => {
+    finish();
+    showUploadError('Upload timed out for "' + file.name + '".');
+  };
+
+  xhr.send(fd);
 }
 async function delFile(id) {
   await fetch(withGrant(`/api/files/${id}`), { method: 'DELETE' });

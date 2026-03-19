@@ -2,6 +2,7 @@
 .venv/
 rag_storage/
 hf_cache/
+whisper_models/
 node_modules/
 .claude/
 data
