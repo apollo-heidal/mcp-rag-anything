@@ -301,16 +301,48 @@ async def _build_embed_func() -> tuple:
     if api_base and embed_model:
         import httpx
 
+        # DMR's llama.cpp backend has n_batch=512 by default — any single
+        # input exceeding ~512 tokens causes a 500 error.  Truncate inputs
+        # to stay safely under the limit (≈ 4 chars/token).
+        _EMBED_MAX_CHARS = 1200  # ~450 tokens — safe margin under DMR n_batch=512
+
+        # Serialise requests: DMR handles one embedding batch at a time.
+        _embed_semaphore = asyncio.Semaphore(1)
+
         async def _embed_via_api(texts: list[str]):
-            async with httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(
-                    f"{api_base}embeddings",
-                    json={"model": embed_model, "input": texts},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            sorted_data = sorted(data["data"], key=lambda d: d["index"])
-            return np.array([d["embedding"] for d in sorted_data], dtype=np.float32)
+            truncated = [t[:_EMBED_MAX_CHARS] for t in texts]
+            max_retries = 5
+            async with _embed_semaphore:
+                for attempt in range(max_retries):
+                    try:
+                        async with httpx.AsyncClient(timeout=120) as client:
+                            resp = await client.post(
+                                f"{api_base}embeddings",
+                                json={"model": embed_model, "input": truncated},
+                            )
+                            if resp.status_code != 200:
+                                logging.warning(
+                                    "Embedding API returned %d (batch=%d, max_chars=%s): %s",
+                                    resp.status_code, len(truncated),
+                                    [len(t) for t in truncated[:3]],
+                                    resp.text[:200],
+                                )
+                            resp.raise_for_status()
+                            data = resp.json()
+                        sorted_data = sorted(data["data"], key=lambda d: d["index"])
+                        return np.array(
+                            [d["embedding"] for d in sorted_data], dtype=np.float32
+                        )
+                    except (httpx.HTTPStatusError, httpx.TimeoutException) as exc:
+                        if attempt < max_retries - 1:
+                            wait = [3, 5, 10, 15][attempt]  # keep total <60s (LightRAG worker timeout)
+                            logging.warning(
+                                "Embedding attempt %d/%d failed (%s), retrying in %ds…",
+                                attempt + 1, max_retries, exc, wait,
+                            )
+                            await asyncio.sleep(wait)
+                        else:
+                            raise
 
         # Probe the API to discover the actual embedding dimension
         probe_dim = int(_get_env("EMBEDDING_DIM", "0"))
@@ -617,6 +649,8 @@ async def _get_rag():
             embedding_func=embed_func,
         )
         _rag = StrictRAGAnything(rag)
+        # Schedule recovery of false-done documents now that RAG is ready
+        asyncio.create_task(_recover_false_done_documents())
         return _rag
 
 
@@ -701,25 +735,116 @@ async def _extract_audio_from_video(file_id: str, video_path: Path) -> Path:
     return output_path
 
 
-async def _transcribe_audio_via_api(audio_path: Path) -> dict:
-    """Transcribe using an OpenAI-compatible whisper API endpoint."""
+_AUDIO_CHUNK_SECONDS = 300  # 5 minutes — whisper.cpp struggles with very long audio
+
+
+async def _get_audio_duration(audio_path: Path) -> float:
+    """Return audio duration in seconds via ffprobe."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "csv=p=0", str(audio_path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    try:
+        return float(stdout.decode().strip())
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+async def _split_audio_chunks(audio_path: Path, chunk_secs: int) -> list[Path]:
+    """Split audio into chunk_secs-length WAV segments. Returns list of paths."""
+    duration = await _get_audio_duration(audio_path)
+    if duration <= 0:
+        return [audio_path]
+    import tempfile
+    tmp_dir = Path(tempfile.mkdtemp(prefix="whisper_chunks_"))
+    segments = []
+    start = 0.0
+    idx = 0
+    while start < duration:
+        out = tmp_dir / f"chunk_{idx:04d}.wav"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", str(audio_path),
+            "-ss", str(start), "-t", str(chunk_secs),
+            "-ar", "16000", "-ac", "1", str(out),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        if out.exists() and out.stat().st_size > 0:
+            segments.append((start, out))
+        start += chunk_secs
+        idx += 1
+    return segments
+
+
+async def _transcribe_single_chunk(url: str, audio_file: Path) -> dict:
+    """Transcribe one audio chunk via the whisper API."""
     import httpx
 
-    api_base = _whisper_api_base()
-    url = f"{api_base}/inference"
     async with httpx.AsyncClient(timeout=600) as client:
-        with open(audio_path, "rb") as f:
+        with open(audio_file, "rb") as f:
             resp = await client.post(
                 url,
-                files={"file": (audio_path.name, f, "audio/wav")},
+                files={"file": (audio_file.name, f, "audio/wav")},
                 data={
                     "model": "whisper-1",
                     "response_format": "verbose_json",
                 },
             )
         resp.raise_for_status()
-    data = resp.json()
+    return resp.json()
 
+
+async def _transcribe_audio_via_api(audio_path: Path) -> dict:
+    """Transcribe using an OpenAI-compatible whisper API endpoint.
+
+    For audio longer than _AUDIO_CHUNK_SECONDS, splits into chunks first
+    to avoid whisper.cpp memory/encoding failures on very long audio.
+    """
+    api_base = _whisper_api_base()
+    url = f"{api_base}/inference"
+
+    duration = await _get_audio_duration(audio_path)
+    if duration > _AUDIO_CHUNK_SECONDS:
+        logging.info(
+            "Audio %.0fs > %ds threshold — splitting into chunks for transcription",
+            duration, _AUDIO_CHUNK_SECONDS,
+        )
+        segments = await _split_audio_chunks(audio_path, _AUDIO_CHUNK_SECONDS)
+        all_chunks = []
+        all_text_parts = []
+        for offset_secs, chunk_path in segments:
+            try:
+                data = await _transcribe_single_chunk(url, chunk_path)
+            except Exception as exc:
+                logging.warning("Whisper chunk %s failed: %s", chunk_path.name, exc)
+                continue
+            finally:
+                chunk_path.unlink(missing_ok=True)
+            text = data.get("text", "").strip()
+            if text:
+                all_text_parts.append(text)
+            for seg in data.get("segments", []):
+                s = seg.get("start")
+                e = seg.get("end")
+                t = seg.get("text", "").strip()
+                if s is not None and e is not None and t:
+                    all_chunks.append({
+                        "start": s + offset_secs,
+                        "end": e + offset_secs,
+                        "text": t,
+                    })
+        # Cleanup temp dir
+        if segments:
+            segments[0][1].parent.rmdir()  # empty after unlinking chunks
+        full_text = " ".join(all_text_parts)
+        if not all_chunks and full_text:
+            all_chunks.append({"start": None, "end": None, "text": full_text})
+        return {"text": full_text, "chunks": all_chunks}
+
+    # Short audio — send directly
+    data = await _transcribe_single_chunk(url, audio_path)
     full_text = data.get("text", "").strip()
     chunks = []
     for seg in data.get("segments", []):
@@ -1094,6 +1219,41 @@ class DocumentEngineAdapter:
 
     async def ingest_file(self, file_path: Path, doc_id: str) -> dict:
         rag = await _get_rag()
+
+        # --- Cascade prevention ---
+        # LightRAG re-processes ALL failed/processing docs on every insert,
+        # causing GPU contention and potentially destroying existing embeddings.
+        # Temporarily mark them as "processed" so the cascade skips them.
+        await rag._ensure_lightrag_initialized()
+        shielded: dict[str, dict] = {}
+        try:
+            from lightrag.base import DocStatus as _DocStatus
+
+            for status_val in (_DocStatus.FAILED, _DocStatus.PROCESSING):
+                docs = await rag.lightrag.doc_status.get_docs_by_status(status_val)
+                for did, status_obj in (docs or {}).items():
+                    if did == doc_id:
+                        continue
+                    # Save original as dict for restore (convert enums to strings)
+                    orig = {}
+                    for k, v in (status_obj.__dict__ if hasattr(status_obj, "__dict__") else {}).items():
+                        orig[k] = v.value if isinstance(v, _DocStatus) else v
+                    if orig:
+                        shielded[did] = orig
+            if shielded:
+                shield_upsert = {
+                    did: {**orig, "status": "processed"}
+                    for did, orig in shielded.items()
+                }
+                await rag.lightrag.doc_status.upsert(shield_upsert)
+                logging.info(
+                    "Cascade prevention: shielded %d docs from re-processing",
+                    len(shielded),
+                )
+        except Exception:
+            logging.warning("Cascade prevention: failed to shield docs", exc_info=True)
+            shielded.clear()
+
         try:
             await rag.process_document_complete(
                 file_path=str(file_path), backend=_mineru_backend, doc_id=doc_id
@@ -1107,6 +1267,34 @@ class DocumentEngineAdapter:
                     "Failed to roll back document %s: %s", doc_id, cleanup_exc
                 )
             raise
+        finally:
+            # Restore shielded docs to their original status
+            if shielded:
+                try:
+                    await rag.lightrag.doc_status.upsert(shielded)
+                    logging.info(
+                        "Cascade prevention: restored %d shielded docs",
+                        len(shielded),
+                    )
+                except Exception:
+                    logging.warning(
+                        "Cascade prevention: failed to restore shielded docs",
+                        exc_info=True,
+                    )
+
+        # Verify LightRAG actually stored embeddings — process_document_complete
+        # may silently swallow embedding failures and return normally while
+        # internally marking the doc as "failed" in kv_store_doc_status.
+        await rag._ensure_lightrag_initialized()
+        doc_entry = await rag.lightrag.doc_status.get_by_id(doc_id)
+        if doc_entry and isinstance(doc_entry, dict):
+            internal_status = doc_entry.get("status", "")
+            if internal_status == "failed":
+                error_msg = doc_entry.get("error_msg", "unknown embedding failure")
+                raise RuntimeError(
+                    f"LightRAG embedding failed for {doc_id}: {error_msg}"
+                )
+
         summary = rag.image_processing_summary()
         capabilities = ["text"]
         if summary["succeeded"]:
@@ -1671,7 +1859,7 @@ function render(files) {
       <td>${f.engine || 'pending'}</td>
       <td id="status-${f.id}">${badge(f.status, f)}</td>
       <td>${fmtDate(f.uploaded_at)}</td>
-      <td><button class="del-btn" onclick="delFile('${f.id}')" title="Remove">&#128465;</button></td>
+      <td>${f.status === 'error' ? `<button class="del-btn" onclick="retryFile('${f.id}')" title="Retry" style="margin-right:4px">&#8635;</button>` : ''}<button class="del-btn" onclick="delFile('${f.id}')" title="Remove">&#128465;</button></td>
     </tr>`).join('');
   files.forEach(f => {
     if (!['done', 'error', 'duplicate'].includes(f.status)) startPoll(f.id);
@@ -1788,6 +1976,10 @@ function upload(file) {
 
   xhr.send(fd);
 }
+async function retryFile(id) {
+  await fetch(withGrant(`/api/files/${id}/retry`), { method: 'POST' });
+  await load();
+}
 async function delFile(id) {
   await fetch(withGrant(`/api/files/${id}`), { method: 'DELETE' });
   clearInterval(polls[id]);
@@ -1814,6 +2006,101 @@ if (!grant) {
 </html>"""
 
 
+async def _recover_false_done_documents():
+    """Detect documents marked 'done' in files.json but 'failed' in LightRAG's
+    internal doc_status (embedding failures that were silently swallowed).
+    Re-queue them for ingestion."""
+    log = logging.getLogger("ingest")
+    log.info("Recovery: starting false-done document scan...")
+    try:
+        rag = await _get_rag()
+        await rag._ensure_lightrag_initialized()
+    except Exception:
+        log.exception("Recovery: failed to initialize RAG — skipping recovery")
+        return
+    log.info("Recovery: RAG initialized, scanning documents...")
+
+    try:
+        records = await _manifest.load()
+        requeued = 0
+        for record in records:
+            if record.get("modality") in ("archive", "video"):
+                continue
+            # Recover: (a) false-done docs with failed LightRAG status, or
+            #          (b) error docs where the error was an embedding/LightRAG failure
+            if record["status"] == "done":
+                doc_id = record.get("engine_doc_id") or record["id"]
+                doc_entry = await rag.lightrag.doc_status.get_by_id(doc_id)
+                if not doc_entry or not isinstance(doc_entry, dict):
+                    continue
+                if doc_entry.get("status") != "failed":
+                    continue
+            elif record["status"] == "error":
+                err = (record.get("error", "") or "").lower()
+                recoverable = (
+                    "embedding" in err
+                    or "lightrag" in err
+                    or "server restarted" in err
+                    or "vdb" in err
+                    or "500 internal server error" in err
+                )
+                if not recoverable:
+                    continue
+                # Check if LightRAG actually has this doc as processed — if so,
+                # the cascade may have fixed it already. Just update files.json.
+                doc_id = record.get("engine_doc_id") or record["id"]
+                doc_entry = await rag.lightrag.doc_status.get_by_id(doc_id)
+                if (
+                    doc_entry
+                    and isinstance(doc_entry, dict)
+                    and doc_entry.get("status") == "processed"
+                    and doc_entry.get("chunks_list")
+                ):
+                    log.info(
+                        "Recovery: %s (%s) already processed in LightRAG with %d chunks — marking done",
+                        record["id"],
+                        record.get("original_name", "?"),
+                        len(doc_entry["chunks_list"]),
+                    )
+                    await _manifest.update(
+                        record["id"], status="done", error=None, queryable=True
+                    )
+                    requeued += 1
+                    continue
+            else:
+                continue
+            doc_id = record.get("engine_doc_id") or record["id"]
+            file_path = Path(record["path"])
+            if not file_path.exists():
+                log.warning("Cannot recover %s — file missing: %s", doc_id, file_path)
+                continue
+            log.warning(
+                "Recovering document %s (%s)",
+                record["id"], record.get("original_name", file_path.name),
+            )
+            # Clean any stale entry from LightRAG so it doesn't cascade-retry
+            try:
+                await rag.lightrag.adelete_by_doc_id(doc_id)
+            except Exception:
+                pass
+            await _manifest.update(
+                record["id"], status="pending", error=None, queryable=False
+            )
+            # Process sequentially to avoid overwhelming DMR with concurrent
+            # LLM + embedding requests (causes 500 errors).
+            log.info("Recovery: re-ingesting %s...", record["id"])
+            await _ingest_background(record["id"], file_path)
+            requeued += 1
+        if requeued:
+            log.info(
+                "Recovery: completed %d false-done documents", requeued
+            )
+        else:
+            log.info("Recovery: no false-done documents found")
+    except Exception:
+        log.exception("Recovery: unexpected error during document recovery scan")
+
+
 @asynccontextmanager
 async def _lifespan(app):
     records = await _manifest.load()
@@ -1823,6 +2110,7 @@ async def _lifespan(app):
                 record["id"], status="error", error="Server restarted during ingestion"
             )
     yield
+    # Shutdown — nothing needed
 
 
 mcp = FastMCP("rag-anywhere", host="0.0.0.0", lifespan=_lifespan)
@@ -1979,6 +2267,38 @@ async def api_file_status(request: Request) -> Response:
         info["archive_progress"] = record.get("archive_progress")
         info["child_ids"] = record.get("child_ids")
     return JSONResponse(info)
+
+
+@mcp.custom_route("/api/files/{file_id}/retry", methods=["POST"])
+async def api_retry_file(request: Request) -> Response:
+    _, error = await _require_grant(request, "ui_session")
+    if error:
+        return error
+    file_id = request.path_params["file_id"]
+    record = await _manifest.get(file_id)
+    if not record:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if file_id in _ingest_tasks:
+        return JSONResponse({"error": "already processing"}, status_code=409)
+    file_path = Path(record["path"])
+    if not file_path.exists():
+        return JSONResponse({"error": "source file missing"}, status_code=410)
+
+    # Clean stale LightRAG state so it doesn't cascade-retry old failures
+    doc_id = record.get("engine_doc_id") or file_id
+    if record.get("engine") == "document":
+        try:
+            rag = await _get_rag()
+            await rag._ensure_lightrag_initialized()
+            await rag.lightrag.adelete_by_doc_id(doc_id)
+        except Exception:
+            pass
+
+    await _manifest.update(file_id, status="pending", error=None, queryable=False)
+    _ingest_tasks[file_id] = asyncio.create_task(
+        _ingest_background(file_id, file_path)
+    )
+    return JSONResponse({"ok": True, "status": "pending"})
 
 
 @mcp.custom_route("/api/files/{file_id}", methods=["DELETE"])
