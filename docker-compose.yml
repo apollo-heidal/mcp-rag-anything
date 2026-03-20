@@ -24,8 +24,6 @@ services:
             # MinerU: offload VLM inference to Docker Model Runner (uses Metal on host)
             # If MinerU needs a separate VLM model, provision it through the local Docker Model Runner workflow.
             - MINERU_BACKEND=pipeline
-            # Vector backend: "milvus" (default) or "nano" (file-based NanoVectorDB)
-            - VECTOR_BACKEND=${VECTOR_BACKEND:-milvus}
             - MILVUS_URI=${MILVUS_URI:-http://milvus:19530}
             - MILVUS_DB_NAME=${MILVUS_DB_NAME:-default}
             - ATTU_URL=${ATTU_URL:-http://localhost:3000}

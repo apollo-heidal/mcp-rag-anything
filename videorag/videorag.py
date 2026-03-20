@@ -23,8 +23,8 @@ from ._op import (
 )
 from ._storage import (
     JsonKVStorage,
-    NanoVectorDBStorage,
-    NanoVectorDBVideoSegmentStorage,
+    MilvusVectorDBStorage,
+    MilvusVectorDBVideoSegmentStorage,
     NetworkXStorage,
 )
 from ._utils import (
@@ -109,8 +109,8 @@ class VideoRAG:
     
     # storage
     key_string_value_json_storage_cls: Type[BaseKVStorage] = JsonKVStorage
-    vector_db_storage_cls: Type[BaseVectorStorage] = NanoVectorDBStorage
-    vs_vector_db_storage_cls: Type[BaseVectorStorage] = NanoVectorDBVideoSegmentStorage
+    vector_db_storage_cls: Type[BaseVectorStorage] = MilvusVectorDBStorage
+    vs_vector_db_storage_cls: Type[BaseVectorStorage] = MilvusVectorDBVideoSegmentStorage
     vector_db_storage_cls_kwargs: dict = field(default_factory=dict)
     graph_storage_cls: Type[BaseGraphStorage] = NetworkXStorage
     enable_llm_cache: bool = True

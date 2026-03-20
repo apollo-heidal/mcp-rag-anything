@@ -14,7 +14,6 @@ import secrets
 import shlex
 import shutil
 import subprocess
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -642,13 +641,12 @@ async def _get_rag():
             embedding_dim=embedding_dim, max_token_size=8192, func=embed_fn
         )
 
-        lightrag_kwargs = {}
-        vector_backend = _get_env("VECTOR_BACKEND", "milvus")
-        if vector_backend == "milvus":
-            lightrag_kwargs["vector_storage"] = "MilvusVectorDBStorage"
-            lightrag_kwargs["vector_db_storage_cls_kwargs"] = {
+        lightrag_kwargs = {
+            "vector_storage": "MilvusVectorDBStorage",
+            "vector_db_storage_cls_kwargs": {
                 "cosine_better_than_threshold": 0.2,
-            }
+            },
+        }
 
         rag = RAGAnything(
             config=config,
@@ -1419,21 +1417,13 @@ class VideoEngineAdapter:
             from videorag import VideoRAG
             from videorag._storage import (
                 JsonKVStorage,
-                NanoVectorDBStorage,
+                MilvusVectorDBStorage,
+                MilvusVectorDBVideoSegmentStorage,
                 NetworkXStorage,
             )
 
-            vector_backend = _get_env("VECTOR_BACKEND", "milvus")
-            if vector_backend == "milvus":
-                from videorag._storage import (
-                    MilvusVectorDBStorage,
-                    MilvusVectorDBVideoSegmentStorage,
-                )
-                vdb_cls = MilvusVectorDBStorage
-                vs_vdb_cls = MilvusVectorDBVideoSegmentStorage
-            else:
-                vdb_cls = NanoVectorDBStorage
-                vs_vdb_cls = NanoVectorDBStorage
+            vdb_cls = MilvusVectorDBStorage
+            vs_vdb_cls = MilvusVectorDBVideoSegmentStorage
 
             llm_config = await self._get_llm_config()
             workspace = self._workspace(file_id)
@@ -2034,10 +2024,22 @@ if (!grant) {
 
 
 async def _recover_false_done_documents():
-    """Detect documents marked 'done' in files.json but 'failed' in LightRAG's
-    internal doc_status (embedding failures that were silently swallowed).
-    Re-queue them for ingestion."""
+    """Mark stale in-progress documents as errors, then detect documents marked
+    'done' in files.json but 'failed' in LightRAG's internal doc_status
+    (embedding failures that were silently swallowed). Re-queue them."""
     log = logging.getLogger("ingest")
+
+    # Mark any documents left in non-terminal state as errors (server restart)
+    records = await _manifest.load()
+    stale = [r for r in records if r["status"] not in {"done", "error"}]
+    if stale:
+        log.info("Recovery: %d stale documents from interrupted ingestion", len(stale))
+        for record in stale:
+            await _manifest.update(
+                record["id"], status="error", error="Server restarted during ingestion"
+            )
+        log.info("Recovery: marked %d stale documents as error", len(stale))
+
     log.info("Recovery: starting false-done document scan...")
     try:
         rag = await _get_rag()
@@ -2129,36 +2131,7 @@ async def _recover_false_done_documents():
         log.exception("Recovery: unexpected error during document recovery scan")
 
 
-async def _startup_recovery():
-    """Initialize RAG on startup to trigger recovery of pending documents."""
-    log = logging.getLogger("ingest")
-    await asyncio.sleep(5)  # Let server finish starting
-    try:
-        log.info("Startup: initializing RAG to trigger document recovery...")
-        await _get_rag()
-    except Exception:
-        log.exception("Startup: failed to initialize RAG for recovery")
-
-
-@asynccontextmanager
-async def _lifespan(app):
-    log = logging.getLogger("ingest")
-    records = await _manifest.load()
-    stale = [r for r in records if r["status"] not in {"done", "error"}]
-    log.info("Lifespan: %d records, %d stale (non-done/error)", len(records), len(stale))
-    for record in stale:
-        await _manifest.update(
-            record["id"], status="error", error="Server restarted during ingestion"
-        )
-    if stale:
-        log.info("Lifespan: marked %d stale documents as error", len(stale))
-    task = asyncio.create_task(_startup_recovery())
-    yield
-    task.cancel()
-    # Shutdown — nothing needed
-
-
-mcp = FastMCP("rag-anywhere", host="0.0.0.0", lifespan=_lifespan)
+mcp = FastMCP("rag-anywhere", host="0.0.0.0")
 
 
 def _safe_filename(file_id: str, original_name: str) -> str:
@@ -2241,9 +2214,8 @@ async def ui_index(request: Request) -> Response:
     if error:
         return error
     html = _UI_HTML
-    vector_backend = _get_env("VECTOR_BACKEND", "milvus")
     attu_url = _get_env("ATTU_URL", "")
-    if vector_backend == "milvus" and attu_url:
+    if attu_url:
         attu_link = (
             f'<a href="{attu_url}" target="_blank" rel="noopener" class="btn-attu">'
             f"&#9881; Milvus Dashboard</a>"
@@ -2417,11 +2389,8 @@ async def api_delete_file(request: Request) -> Response:
     return JSONResponse({"ok": bool(removed)})
 
 
-def _milvus_health() -> dict:
-    """Probe Milvus connectivity when the vector backend is milvus."""
-    vector_backend = _get_env("VECTOR_BACKEND", "milvus")
-    if vector_backend != "milvus":
-        return {"backend": "nano", "ok": True}
+def _vector_health() -> dict:
+    """Probe Milvus connectivity."""
     uri = _get_env("MILVUS_URI", "http://localhost:19530")
     try:
         from pymilvus import MilvusClient
@@ -2442,7 +2411,7 @@ def _milvus_health() -> dict:
 async def api_health(request: Request) -> Response:
     video_health = await _video_engine.health()
     vision_health = await _probe_vision_model()
-    vector_health = _milvus_health()
+    vector_health = _vector_health()
     return JSONResponse(
         {
             "ok": True,

@@ -1,6 +1,6 @@
 from .gdb_networkx import NetworkXStorage
-from .vdb_nanovectordb import NanoVectorDBStorage, NanoVectorDBVideoSegmentStorage
 from .kv_json import JsonKVStorage
+from .vdb_milvus import MilvusVectorDBStorage, MilvusVectorDBVideoSegmentStorage
 
 try:
     from .gdb_neo4j import Neo4jStorage
@@ -9,11 +9,5 @@ except ModuleNotFoundError:  # Optional backend; this project uses NetworkXStora
 
 try:
     from .vdb_hnswlib import HNSWVectorStorage
-except ModuleNotFoundError:  # Optional backend; this project uses NanoVectorDBStorage.
+except ModuleNotFoundError:  # Optional backend.
     HNSWVectorStorage = None
-
-try:
-    from .vdb_milvus import MilvusVectorDBStorage, MilvusVectorDBVideoSegmentStorage
-except ModuleNotFoundError:  # Optional backend; requires pymilvus.
-    MilvusVectorDBStorage = None
-    MilvusVectorDBVideoSegmentStorage = None
