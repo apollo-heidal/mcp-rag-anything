@@ -1,0 +1,39 @@
+services:
+    rag-anywhere-test:
+        build: .
+        ports:
+            - "8001:8000"
+        volumes:
+            - ./rag_storage_test:/root/.rag_storage
+            - ./hf_cache:/root/.cache/huggingface
+        environment:
+            - OPENAI_API_KEY=docker-model-runner
+            - RAG_WORKING_DIR=/root/.rag_storage
+            - APP_BASE_URL=http://localhost:8001
+            - RAG_SESSION_SECRET=test-secret
+            - UI_SESSION_TTL_SECONDS=3600
+            - UPLOAD_LINK_TTL_SECONDS=3600
+            - FASTMCP_HOST=0.0.0.0
+            - DEFAULT_COLLECTION_ID=default
+            - VISION_REQUIRED=false
+            - VIDEO_ENGINE_ENABLED=false
+            - AUDIO_TRANSCRIBE_MODEL=openai/whisper-small
+            - MINERU_BACKEND=pipeline
+        models:
+            llm:
+                endpoint_var: LLM_API_BASE
+                model_var: LLM_MODEL
+            vision:
+                endpoint_var: VISION_API_BASE
+                model_var: VISION_MODEL
+            embedding:
+                endpoint_var: EMBEDDING_API_BASE
+                model_var: EMBEDDING_MODEL
+
+models:
+    llm:
+        model: ${LLM_MODEL:-hf.co/unsloth/Qwen3.5-2B-GGUF}
+    vision:
+        model: ${VISION_MODEL:-docker.io/local/qwen3.5-2b-vlm:latest}
+    embedding:
+        model: ${EMBEDDING_MODEL:-hf.co/unsloth/Qwen3-Embedding-0.6B}

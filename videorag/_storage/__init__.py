@@ -11,3 +11,9 @@ try:
     from .vdb_hnswlib import HNSWVectorStorage
 except ModuleNotFoundError:  # Optional backend; this project uses NanoVectorDBStorage.
     HNSWVectorStorage = None
+
+try:
+    from .vdb_milvus import MilvusVectorDBStorage, MilvusVectorDBVideoSegmentStorage
+except ModuleNotFoundError:  # Optional backend; requires pymilvus.
+    MilvusVectorDBStorage = None
+    MilvusVectorDBVideoSegmentStorage = None

@@ -642,11 +642,20 @@ async def _get_rag():
             embedding_dim=embedding_dim, max_token_size=8192, func=embed_fn
         )
 
+        lightrag_kwargs = {}
+        vector_backend = _get_env("VECTOR_BACKEND", "milvus")
+        if vector_backend == "milvus":
+            lightrag_kwargs["vector_storage"] = "MilvusVectorDBStorage"
+            lightrag_kwargs["vector_db_storage_cls_kwargs"] = {
+                "cosine_better_than_threshold": 0.2,
+            }
+
         rag = RAGAnything(
             config=config,
             llm_model_func=llm_func,
             vision_model_func=vision_func,
             embedding_func=embed_func,
+            lightrag_kwargs=lightrag_kwargs,
         )
         _rag = StrictRAGAnything(rag)
         # Schedule recovery of false-done documents now that RAG is ready
@@ -1414,6 +1423,18 @@ class VideoEngineAdapter:
                 NetworkXStorage,
             )
 
+            vector_backend = _get_env("VECTOR_BACKEND", "milvus")
+            if vector_backend == "milvus":
+                from videorag._storage import (
+                    MilvusVectorDBStorage,
+                    MilvusVectorDBVideoSegmentStorage,
+                )
+                vdb_cls = MilvusVectorDBStorage
+                vs_vdb_cls = MilvusVectorDBVideoSegmentStorage
+            else:
+                vdb_cls = NanoVectorDBStorage
+                vs_vdb_cls = NanoVectorDBStorage
+
             llm_config = await self._get_llm_config()
             workspace = self._workspace(file_id)
             workspace.mkdir(parents=True, exist_ok=True)
@@ -1421,8 +1442,8 @@ class VideoEngineAdapter:
                 working_dir=str(workspace),
                 llm=llm_config,
                 key_string_value_json_storage_cls=JsonKVStorage,
-                vector_db_storage_cls=NanoVectorDBStorage,
-                vs_vector_db_storage_cls=NanoVectorDBStorage,
+                vector_db_storage_cls=vdb_cls,
+                vs_vector_db_storage_cls=vs_vdb_cls,
                 graph_storage_cls=NetworkXStorage,
                 video_segment_length=self.segment_length,
                 video_embedding_dim=llm_config.embedding_dim,
@@ -1719,6 +1740,12 @@ _UI_HTML = """<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; min-height: 100vh; padding: 2rem; }
   h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.25rem; }
+  .page-header { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.25rem; }
+  .page-header h1 { margin-bottom: 0; }
+  .btn-attu { margin-left: auto; display: inline-flex; align-items: center; gap: 0.4rem;
+    padding: 0.4rem 0.9rem; border: 1px solid var(--border); border-radius: var(--radius);
+    color: var(--muted); font-size: 0.78rem; text-decoration: none; transition: all 0.15s; }
+  .btn-attu:hover { color: var(--accent); border-color: var(--accent); }
   .subtitle { color: var(--muted); font-size: 0.875rem; margin-bottom: 2rem; max-width: 60rem; }
   .drop-zone {
     border: 2px dashed var(--border); border-radius: var(--radius);
@@ -1777,7 +1804,7 @@ _UI_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>RAG-Anywhere</h1>
+<div class="page-header"><h1>RAG-Anywhere</h1><!-- ATTU_LINK --></div>
 <p class="subtitle">Uploads are routed by modality: documents go to RAGAnything, audio is transcribed into the document graph, and video is indexed by the in-process VideoEngineAdapter. Access to this library is granted by a signed session link.</p>
 
 <div class="drop-zone" id="dropZone">
@@ -2067,6 +2094,7 @@ async def _recover_false_done_documents():
                     )
                     requeued += 1
                     continue
+                # Not already processed — fall through to re-ingest
             else:
                 continue
             doc_id = record.get("engine_doc_id") or record["id"]
@@ -2101,15 +2129,32 @@ async def _recover_false_done_documents():
         log.exception("Recovery: unexpected error during document recovery scan")
 
 
+async def _startup_recovery():
+    """Initialize RAG on startup to trigger recovery of pending documents."""
+    log = logging.getLogger("ingest")
+    await asyncio.sleep(5)  # Let server finish starting
+    try:
+        log.info("Startup: initializing RAG to trigger document recovery...")
+        await _get_rag()
+    except Exception:
+        log.exception("Startup: failed to initialize RAG for recovery")
+
+
 @asynccontextmanager
 async def _lifespan(app):
+    log = logging.getLogger("ingest")
     records = await _manifest.load()
-    for record in records:
-        if record["status"] not in {"done", "error"}:
-            await _manifest.update(
-                record["id"], status="error", error="Server restarted during ingestion"
-            )
+    stale = [r for r in records if r["status"] not in {"done", "error"}]
+    log.info("Lifespan: %d records, %d stale (non-done/error)", len(records), len(stale))
+    for record in stale:
+        await _manifest.update(
+            record["id"], status="error", error="Server restarted during ingestion"
+        )
+    if stale:
+        log.info("Lifespan: marked %d stale documents as error", len(stale))
+    task = asyncio.create_task(_startup_recovery())
     yield
+    task.cancel()
     # Shutdown — nothing needed
 
 
@@ -2195,7 +2240,18 @@ async def ui_index(request: Request) -> Response:
     _, error = await _require_grant(request, "ui_session")
     if error:
         return error
-    return HTMLResponse(_UI_HTML)
+    html = _UI_HTML
+    vector_backend = _get_env("VECTOR_BACKEND", "milvus")
+    attu_url = _get_env("ATTU_URL", "")
+    if vector_backend == "milvus" and attu_url:
+        attu_link = (
+            f'<a href="{attu_url}" target="_blank" rel="noopener" class="btn-attu">'
+            f"&#9881; Milvus Dashboard</a>"
+        )
+    else:
+        attu_link = ""
+    html = html.replace("<!-- ATTU_LINK -->", attu_link)
+    return HTMLResponse(html)
 
 
 @mcp.custom_route("/api/files", methods=["GET"])
@@ -2361,10 +2417,32 @@ async def api_delete_file(request: Request) -> Response:
     return JSONResponse({"ok": bool(removed)})
 
 
+def _milvus_health() -> dict:
+    """Probe Milvus connectivity when the vector backend is milvus."""
+    vector_backend = _get_env("VECTOR_BACKEND", "milvus")
+    if vector_backend != "milvus":
+        return {"backend": "nano", "ok": True}
+    uri = _get_env("MILVUS_URI", "http://localhost:19530")
+    try:
+        from pymilvus import MilvusClient
+
+        client = MilvusClient(uri=uri)
+        collections = client.list_collections()
+        return {
+            "backend": "milvus",
+            "ok": True,
+            "uri": uri,
+            "collections": len(collections),
+        }
+    except Exception as exc:
+        return {"backend": "milvus", "ok": False, "uri": uri, "error": str(exc)}
+
+
 @mcp.custom_route("/api/health", methods=["GET"])
 async def api_health(request: Request) -> Response:
     video_health = await _video_engine.health()
     vision_health = await _probe_vision_model()
+    vector_health = _milvus_health()
     return JSONResponse(
         {
             "ok": True,
@@ -2378,6 +2456,7 @@ async def api_health(request: Request) -> Response:
                     _get_env("UPLOAD_LINK_TTL_SECONDS", "900")
                 ),
             },
+            "vector_db": vector_health,
             "video_engine": video_health,
             "vision_model": _get_env(
                 "VISION_MODEL", "docker.io/local/qwen3.5-2b-vlm:latest"
