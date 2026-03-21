@@ -1,0 +1,20 @@
+:8000 {
+    handle /database {
+        header Content-Type text/html
+        respond `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Connecting…</title></head>
+<body><p>Connecting to Milvus…</p><script>
+fetch("/database/api/v1/milvus/connect",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({address:"milvus:19530",database:"default"})})
+.then(r=>r.json()).then(d=>{localStorage.setItem("milvus-client-id",d.data.clientId);window.location.replace("/database/");})
+.catch(()=>window.location.replace("/database/"));
+</script></body></html>`
+    }
+
+    handle_path /database/* {
+        reverse_proxy attu:3000
+    }
+
+    handle {
+        reverse_proxy rag-anywhere:8000
+    }
+}

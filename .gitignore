@@ -1,6 +1,6 @@
 .env
 .venv/
-rag_storage/
+rag_storage*
 hf_cache/
 whisper_models/
 node_modules/
@@ -15,3 +15,4 @@ model_assets
 .sidecar-start.sh
 .sidecar-base
 .td-root
+__pycache__

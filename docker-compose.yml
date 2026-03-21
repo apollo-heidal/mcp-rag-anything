@@ -1,8 +1,16 @@
 services:
-    rag-anywhere:
-        build: .
+    caddy:
+        image: caddy:2-alpine
         ports:
             - "8000:8000"
+        volumes:
+            - ./Caddyfile:/etc/caddy/Caddyfile:ro
+        depends_on:
+            - rag-anywhere
+            - attu
+
+    rag-anywhere:
+        build: .
         volumes:
             - ./rag_storage:/root/.rag_storage
             - ./hf_cache:/root/.cache/huggingface
@@ -14,6 +22,7 @@ services:
             - UI_SESSION_TTL_SECONDS=${UI_SESSION_TTL_SECONDS:-900}
             - UPLOAD_LINK_TTL_SECONDS=${UPLOAD_LINK_TTL_SECONDS:-900}
             - FASTMCP_HOST=0.0.0.0
+            - FASTMCP_PORT=8000
             - DEFAULT_COLLECTION_ID=default
             - VISION_REQUIRED=${VISION_REQUIRED:-true}
             - VIDEO_ENGINE_ENABLED=${VIDEO_ENGINE_ENABLED:-true}
@@ -26,7 +35,6 @@ services:
             - MINERU_BACKEND=pipeline
             - MILVUS_URI=${MILVUS_URI:-http://milvus:19530}
             - MILVUS_DB_NAME=${MILVUS_DB_NAME:-default}
-            - ATTU_URL=${ATTU_URL:-http://localhost:3000}
         models:
             llm:
                 endpoint_var: LLM_API_BASE
@@ -124,8 +132,7 @@ services:
         image: zilliz/attu:v2.4.12
         environment:
             MILVUS_URL: milvus:19530
-        ports:
-            - "3000:3000"
+            HOST_URL: /database
         depends_on:
             milvus:
                 condition: service_healthy

@@ -322,7 +322,8 @@ async def _build_embed_func() -> tuple:
                             if resp.status_code != 200:
                                 logging.warning(
                                     "Embedding API returned %d (batch=%d, max_chars=%s): %s",
-                                    resp.status_code, len(truncated),
+                                    resp.status_code,
+                                    len(truncated),
                                     [len(t) for t in truncated[:3]],
                                     resp.text[:200],
                                 )
@@ -334,10 +335,15 @@ async def _build_embed_func() -> tuple:
                         )
                     except (httpx.HTTPStatusError, httpx.TimeoutException) as exc:
                         if attempt < max_retries - 1:
-                            wait = [3, 5, 10, 15][attempt]  # keep total <60s (LightRAG worker timeout)
+                            wait = [3, 5, 10, 15][
+                                attempt
+                            ]  # keep total <60s (LightRAG worker timeout)
                             logging.warning(
                                 "Embedding attempt %d/%d failed (%s), retrying in %ds…",
-                                attempt + 1, max_retries, exc, wait,
+                                attempt + 1,
+                                max_retries,
+                                exc,
+                                wait,
                             )
                             await asyncio.sleep(wait)
                         else:
@@ -748,9 +754,16 @@ _AUDIO_CHUNK_SECONDS = 300  # 5 minutes — whisper.cpp struggles with very long
 async def _get_audio_duration(audio_path: Path) -> float:
     """Return audio duration in seconds via ffprobe."""
     proc = await asyncio.create_subprocess_exec(
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "csv=p=0", str(audio_path),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "csv=p=0",
+        str(audio_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
     stdout, _ = await proc.communicate()
     try:
@@ -765,6 +778,7 @@ async def _split_audio_chunks(audio_path: Path, chunk_secs: int) -> list[Path]:
     if duration <= 0:
         return [audio_path]
     import tempfile
+
     tmp_dir = Path(tempfile.mkdtemp(prefix="whisper_chunks_"))
     segments = []
     start = 0.0
@@ -772,10 +786,21 @@ async def _split_audio_chunks(audio_path: Path, chunk_secs: int) -> list[Path]:
     while start < duration:
         out = tmp_dir / f"chunk_{idx:04d}.wav"
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", str(audio_path),
-            "-ss", str(start), "-t", str(chunk_secs),
-            "-ar", "16000", "-ac", "1", str(out),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(audio_path),
+            "-ss",
+            str(start),
+            "-t",
+            str(chunk_secs),
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            str(out),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         await proc.communicate()
         if out.exists() and out.stat().st_size > 0:
@@ -816,7 +841,8 @@ async def _transcribe_audio_via_api(audio_path: Path) -> dict:
     if duration > _AUDIO_CHUNK_SECONDS:
         logging.info(
             "Audio %.0fs > %ds threshold — splitting into chunks for transcription",
-            duration, _AUDIO_CHUNK_SECONDS,
+            duration,
+            _AUDIO_CHUNK_SECONDS,
         )
         segments = await _split_audio_chunks(audio_path, _AUDIO_CHUNK_SECONDS)
         all_chunks = []
@@ -837,11 +863,13 @@ async def _transcribe_audio_via_api(audio_path: Path) -> dict:
                 e = seg.get("end")
                 t = seg.get("text", "").strip()
                 if s is not None and e is not None and t:
-                    all_chunks.append({
-                        "start": s + offset_secs,
-                        "end": e + offset_secs,
-                        "text": t,
-                    })
+                    all_chunks.append(
+                        {
+                            "start": s + offset_secs,
+                            "end": e + offset_secs,
+                            "text": t,
+                        }
+                    )
         # Cleanup temp dir
         if segments:
             segments[0][1].parent.rmdir()  # empty after unlinking chunks
@@ -855,11 +883,13 @@ async def _transcribe_audio_via_api(audio_path: Path) -> dict:
     full_text = data.get("text", "").strip()
     chunks = []
     for seg in data.get("segments", []):
-        chunks.append({
-            "start": seg.get("start"),
-            "end": seg.get("end"),
-            "text": seg.get("text", "").strip(),
-        })
+        chunks.append(
+            {
+                "start": seg.get("start"),
+                "end": seg.get("end"),
+                "text": seg.get("text", "").strip(),
+            }
+        )
     if not chunks and full_text:
         chunks.append({"start": None, "end": None, "text": full_text})
     return {"text": full_text, "chunks": chunks}
@@ -908,11 +938,13 @@ async def _transcribe_audio_local(audio_path: Path) -> dict:
         if isinstance(entry, dict):
             full_text = entry.get("text", "").strip()
             for offset in entry.get("offsets", []):
-                chunks.append({
-                    "start": offset.get("timestamp", (None, None))[0],
-                    "end": offset.get("timestamp", (None, None))[1],
-                    "text": offset.get("text", "").strip(),
-                })
+                chunks.append(
+                    {
+                        "start": offset.get("timestamp", (None, None))[0],
+                        "end": offset.get("timestamp", (None, None))[1],
+                        "text": offset.get("text", "").strip(),
+                    }
+                )
         else:
             full_text = str(entry).strip()
 
@@ -1243,7 +1275,9 @@ class DocumentEngineAdapter:
                         continue
                     # Save original as dict for restore (convert enums to strings)
                     orig = {}
-                    for k, v in (status_obj.__dict__ if hasattr(status_obj, "__dict__") else {}).items():
+                    for k, v in (
+                        status_obj.__dict__ if hasattr(status_obj, "__dict__") else {}
+                    ).items():
                         orig[k] = v.value if isinstance(v, _DocStatus) else v
                     if orig:
                         shielded[did] = orig
@@ -1625,11 +1659,13 @@ async def _ingest_archive(file_id: str, file_path: Path, record: dict) -> dict:
             content_hash = await compute_file_hash(child_path)
             existing = await _manifest.find_by_hash(content_hash)
             if existing:
-                skipped.append({
-                    "name": child_path.name,
-                    "duplicate_of": existing["id"],
-                    "original_name": existing["original_name"],
-                })
+                skipped.append(
+                    {
+                        "name": child_path.name,
+                        "duplicate_of": existing["id"],
+                        "original_name": existing["original_name"],
+                    }
+                )
                 continue
 
             child_id = uuid4().hex[:8]
@@ -2106,7 +2142,8 @@ async def _recover_false_done_documents():
                 continue
             log.warning(
                 "Recovering document %s (%s)",
-                record["id"], record.get("original_name", file_path.name),
+                record["id"],
+                record.get("original_name", file_path.name),
             )
             # Clean any stale entry from LightRAG so it doesn't cascade-retry
             try:
@@ -2122,9 +2159,7 @@ async def _recover_false_done_documents():
             await _ingest_background(record["id"], file_path)
             requeued += 1
         if requeued:
-            log.info(
-                "Recovery: completed %d false-done documents", requeued
-            )
+            log.info("Recovery: completed %d false-done documents", requeued)
         else:
             log.info("Recovery: no false-done documents found")
     except Exception:
@@ -2210,18 +2245,11 @@ async def _store_upload_file(upload, collection_id: str) -> dict:
 
 @mcp.custom_route("/ui", methods=["GET"])
 async def ui_index(request: Request) -> Response:
-    _, error = await _require_grant(request, "ui_session")
-    if error:
-        return error
+    # _, error = await _require_grant(request, "ui_session")
+    # if error:
+    #     return error
     html = _UI_HTML
-    attu_url = _get_env("ATTU_URL", "")
-    if attu_url:
-        attu_link = (
-            f'<a href="{attu_url}" target="_blank" rel="noopener" class="btn-attu">'
-            f"&#9881; Milvus Dashboard</a>"
-        )
-    else:
-        attu_link = ""
+    attu_link = '<a href="/database" class="btn-attu">&#9881; Milvus Dashboard</a>'
     html = html.replace("<!-- ATTU_LINK -->", attu_link)
     return HTMLResponse(html)
 
@@ -2323,9 +2351,7 @@ async def api_retry_file(request: Request) -> Response:
             pass
 
     await _manifest.update(file_id, status="pending", error=None, queryable=False)
-    _ingest_tasks[file_id] = asyncio.create_task(
-        _ingest_background(file_id, file_path)
-    )
+    _ingest_tasks[file_id] = asyncio.create_task(_ingest_background(file_id, file_path))
     return JSONResponse({"ok": True, "status": "pending"})
 
 
@@ -2453,11 +2479,13 @@ async def _ingest_paths(paths: list[str], recursive: bool = True) -> dict:
         content_hash = await compute_file_hash(file_path)
         existing = await _manifest.find_by_hash(content_hash)
         if existing:
-            skipped.append({
-                "path": str(file_path),
-                "duplicate_of": existing["id"],
-                "original_name": existing["original_name"],
-            })
+            skipped.append(
+                {
+                    "path": str(file_path),
+                    "duplicate_of": existing["id"],
+                    "original_name": existing["original_name"],
+                }
+            )
             return
 
         file_id = uuid4().hex[:8]
